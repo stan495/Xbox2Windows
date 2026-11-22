@@ -1,0 +1,15 @@
+EXPORTS
+    pabsb_op
+    pabsw_op
+    pabsd_op
+    psignb_op
+    psignw_op
+    psignd_op
+    palignr_op
+    pshufb_op
+    phaddw_op
+    phaddd_op
+    phaddsw_op
+    phsubw_op
+    phsubd_op
+    phsubsw_op

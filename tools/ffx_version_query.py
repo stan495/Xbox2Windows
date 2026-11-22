@@ -268,6 +268,14 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
         M.PMADDUBSW, M.PMULHRSW, M.PHMINPOSUW, M.PTEST, M.MPSADBW, M.PCMPGTQ,
     }
     has_wide |= any(i.mnemonic in sse41_42_misc_ops for i in body)
+    ssse3_ops = {
+        M.PABSB, M.PABSW, M.PABSD,
+        M.PSIGNB, M.PSIGNW, M.PSIGND,
+        M.PALIGNR, M.PSHUFB,
+        M.PHADDW, M.PHADDD, M.PHADDSW,
+        M.PHSUBW, M.PHSUBD, M.PHSUBSW,
+    }
+    has_wide |= any(i.mnemonic in ssse3_ops for i in body)
     if any(i.code in STRING_OPS or i.mnemonic in (M.CLD, M.STD) for i in body):
         # The x64 software conventions expect DF clear on function exit and before calls, so it starts clear.
         lines.append("bool direction=false;")
@@ -1068,6 +1076,65 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                 stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+=8) {{ "
                         f"int64_t a, b; memcpy(&a, {dst}.data()+n, 8); memcpy(&b, rhs.data()+n, 8); "
                         f"const uint64_t v = a > b ? ~0ull : 0ull; memcpy({dst}.data()+n, &v, 8); }} }}")
+        elif (op in ssse3_ops and i.encoding == EncodingKind.LEGACY and i.op0_kind == K.REGISTER
+              and i.op0_register in wide_xmm and has_wide):
+            dst = wide_xmm[i.op0_register]
+            if i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
+                src_init = f"std::array<uint8_t,16> rhs; memcpy(rhs.data(), {wide_xmm[i.op1_register]}.data(), 16);"
+            else:
+                raise ValueError(f"unsupported SSSE3 source at {i.ip:#x}: {i}")
+            if op in (M.PABSB, M.PABSW, M.PABSD):
+                sz = {M.PABSB: 1, M.PABSW: 2, M.PABSD: 4}[op]
+                st = {1: "int8_t", 2: "int16_t", 4: "int32_t"}[sz]
+                ut = UINT[sz]
+                stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+={sz}) {{ "
+                        f"{st} s; memcpy(&s, rhs.data()+n, {sz}); "
+                        f"const {ut} v = s < 0 ? static_cast<{ut}>(0u - static_cast<{ut}>(s)) : static_cast<{ut}>(s); "
+                        f"memcpy({dst}.data()+n, &v, {sz}); }} }}")
+            elif op in (M.PSIGNB, M.PSIGNW, M.PSIGND):
+                sz = {M.PSIGNB: 1, M.PSIGNW: 2, M.PSIGND: 4}[op]
+                st = {1: "int8_t", 2: "int16_t", 4: "int32_t"}[sz]
+                ut = UINT[sz]
+                stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+={sz}) {{ "
+                        f"{ut} x; {st} c; memcpy(&x, {dst}.data()+n, {sz}); memcpy(&c, rhs.data()+n, {sz}); "
+                        f"const {ut} v = c < 0 ? static_cast<{ut}>(0u - x) : (c == 0 ? 0u : x); "
+                        f"memcpy({dst}.data()+n, &v, {sz}); }} }}")
+            elif op == M.PALIGNR:
+                imm = i.immediate(2)
+                stmt = (f"{{ std::array<uint8_t,16> lhs; memcpy(lhs.data(), {dst}.data(), 16); {src_init} "
+                        f"for (size_t n=0; n<16; ++n) {{ const size_t idx = n + {imm}; "
+                        f"{dst}[n] = static_cast<uint8_t>(idx < 16 ? rhs[idx] : (idx < 32 ? lhs[idx - 16] : 0)); }} }}")
+            elif op == M.PSHUFB:
+                stmt = (f"{{ std::array<uint8_t,16> lhs; memcpy(lhs.data(), {dst}.data(), 16); {src_init} "
+                        f"for (size_t n=0; n<16; ++n) {{ const uint8_t ctrl = rhs[n]; "
+                        f"{dst}[n] = (ctrl & 0x80u) ? 0u : lhs[ctrl & 0x0fu]; }} }}")
+            elif op in (M.PHADDW, M.PHADDD):
+                sz = 2 if op == M.PHADDW else 4
+                st = "int16_t" if sz == 2 else "int32_t"
+                cnt = 4 if sz == 2 else 2
+                stmt = (f"{{ std::array<uint8_t,16> lhs; memcpy(lhs.data(), {dst}.data(), 16); {src_init} "
+                        f"for (size_t k=0; k<{cnt * 2}; ++k) {{ "
+                        f"const auto& src = k < {cnt} ? lhs : rhs; const size_t off = (k % {cnt}) * {sz * 2}; "
+                        f"{st} x, y; memcpy(&x, src.data()+off, {sz}); memcpy(&y, src.data()+off+{sz}, {sz}); "
+                        f"const {st} s = static_cast<{st}>(x + y); memcpy({dst}.data()+{sz}*k, &s, {sz}); }} }}")
+            elif op in (M.PHSUBW, M.PHSUBD):
+                sz = 2 if op == M.PHSUBW else 4
+                st = "int16_t" if sz == 2 else "int32_t"
+                cnt = 4 if sz == 2 else 2
+                stmt = (f"{{ std::array<uint8_t,16> lhs; memcpy(lhs.data(), {dst}.data(), 16); {src_init} "
+                        f"for (size_t k=0; k<{cnt * 2}; ++k) {{ "
+                        f"const auto& src = k < {cnt} ? lhs : rhs; const size_t off = (k % {cnt}) * {sz * 2}; "
+                        f"{st} x, y; memcpy(&x, src.data()+off, {sz}); memcpy(&y, src.data()+off+{sz}, {sz}); "
+                        f"const {st} s = static_cast<{st}>(x - y); memcpy({dst}.data()+{sz}*k, &s, {sz}); }} }}")
+            else:  # M.PHADDSW, M.PHSUBSW
+                sign = "+" if op == M.PHADDSW else "-"
+                stmt = (f"{{ std::array<uint8_t,16> lhs; memcpy(lhs.data(), {dst}.data(), 16); {src_init} "
+                        f"for (size_t k=0; k<8; ++k) {{ "
+                        f"const auto& src = k < 4 ? lhs : rhs; const size_t off = (k % 4) * 4; "
+                        f"int16_t x, y; memcpy(&x, src.data()+off, 2); memcpy(&y, src.data()+off+2, 2); "
+                        f"const int s = int(x) {sign} int(y); "
+                        f"const int16_t v = static_cast<int16_t>(s < -32768 ? -32768 : (s > 32767 ? 32767 : s)); "
+                        f"memcpy({dst}.data()+2*k, &v, 2); }} }}")
         elif op == M.VMOVUPS and i.op1_kind == K.MEMORY:
             stmt = f"{wide[i.op0_register]} = load<std::array<uint8_t,32>>({address()});"
         elif op == M.VMOVUPS and i.op0_kind == K.MEMORY:
