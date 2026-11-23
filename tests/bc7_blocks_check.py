@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from bc7_blocks import (ANCHORS_2, ANCHORS_3, MODES, PARTITIONS_2, PARTITIONS_3, anchors, decode,
                         fixture, fixture_fields, layout, pack, subsets, unpack)
 import bcpack_mode6_vector as mode6
+import bcpack_mode6_multiblock_vector as multi_mode6
 from bc7_draw_check import make_block
 
 try:
@@ -54,6 +55,22 @@ class BlockChecks(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("BCPACK_REFERENCE_TOOLS"), "optional Leonida reference decoder")
     def test_bcpack_mode6_strict_reference(self):
         subprocess.run([sys.executable, "-B", mode6.__file__, os.environ["BCPACK_REFERENCE_TOOLS"]], check=True)
+
+    def test_bcpack_mode6_multiblock_vector(self):
+        b0_rgba = decode(multi_mode6.BLOCKS[:16])
+        b1_rgba = decode(multi_mode6.BLOCKS[16:])
+        self.assertEqual(multi_mode6.raster_8x4(b0_rgba, b1_rgba), multi_mode6.RGBA)
+        # Swapping the two decoded blocks produces a surface mismatch.
+        self.assertNotEqual(multi_mode6.raster_8x4(b1_rgba, b0_rgba), multi_mode6.RGBA)
+        # Change the last selector of the second block from 15 to 0; only the final pixel (7, 3) changes.
+        changed_b1 = multi_mode6.BLOCKS[16:-1] + bytes([multi_mode6.BLOCKS[-1] & 0x0f])
+        expected_last_pixel = bytes((40, 120, 220, 200))
+        self.assertEqual(multi_mode6.raster_8x4(b0_rgba, decode(changed_b1)),
+                         multi_mode6.RGBA[:-4] + expected_last_pixel)
+
+    @unittest.skipUnless(os.environ.get("BCPACK_REFERENCE_TOOLS"), "optional Leonida reference decoder")
+    def test_bcpack_mode6_multiblock_strict_reference(self):
+        subprocess.run([sys.executable, "-B", multi_mode6.__file__, os.environ["BCPACK_REFERENCE_TOOLS"]], check=True)
 
     def test_field_offsets(self):
         for mode, expected in enumerate(OFFSETS):

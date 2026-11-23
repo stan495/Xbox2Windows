@@ -3335,6 +3335,12 @@ The [fixture supplied in #442](https://github.com/R0Y00/Xbox2Windows/issues/442)
 
 The CPU block test and the D3D12 BC7 draw tests check all 16 RGBA texels against fixed expected bytes. Changing the last selector from 15 to 0 selects the opposite endpoint only for the final texel. This covers a single zero-history synthetic vector. The local BCPack probe does not decode arbitrary BC7 streams.
 
+### Two synthetic BCPack mode-6 blocks
+
+`tests/bcpack_mode6_multiblock_vector.py` pins 132 packed bytes containing two distinguishable mode-6 blocks and the expected 32-byte BC7 sequence (8×4 pixels). The optional [Leonida reference decoder](https://github.com/timelery/Leonida/tree/03d1e118a676d73aba66b1793cf033f6ad23b2b2/tools) reproduces both blocks in strict mode with an empty provisional set, and truncated streams fail before upload.
+
+The CPU block check and the D3D12 BC7 draw tests compare all 32 RGBA texels against fixed expected bytes on WARP and hardware. Swapping the two decoded blocks fails GPU readback (`pixel_mismatch x=0 y=0`), and mutating the final selector in block 1 produces an isolated mismatch at pixel `(7, 3)`.
+
 ### Exporting two TTPF entries to DDS
 
 These measurements use Leonida's Python exporter on Windows with Python 3.14.2. Both indices are zero-based and refer to the same local `ttdb_ui.ttpf` pool, 845,115,648 bytes, SHA-256 `dc983ed7f6b78d1693fa5757f17c03bafb790e851594fdf4d412579b61d867f6`. The SHA-256 values in the table cover each complete DDS, including its header. Original pixel colours and coverage across the full set remain unverified. [Measurement request](https://github.com/R0Y00/Xbox2Windows/issues/458#issuecomment-7074603775)

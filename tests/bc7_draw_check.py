@@ -6,6 +6,7 @@ import sys
 import tempfile
 
 import bcpack_mode6_vector as mode6
+import bcpack_mode6_multiblock_vector as multi_mode6
 from pixel_aot_check import assembly, lod_zero_sample, translate
 from bc7_tiles import linearize_4k_s
 
@@ -179,6 +180,24 @@ def main():
         vector = work / "bcpack-mode6.case"
         vector.write_bytes(struct.pack("<4sII", b"BC7C", 4, 4) + mode6.BLOCK + mode6.RGBA)
         subprocess.run([renderer, backend, "--check-bc7", shader, vector], check=True)
+        multi_vector = work / "bcpack-mode6-multiblock.case"
+        multi_vector.write_bytes(struct.pack("<4sII", b"BC7C", 8, 4) + multi_mode6.BLOCKS + multi_mode6.RGBA)
+        subprocess.run([renderer, backend, "--check-bc7", shader, multi_vector], check=True)
+        multi_swapped = work / "bcpack-mode6-multiblock-swapped.case"
+        multi_swapped.write_bytes(struct.pack("<4sII", b"BC7C", 8, 4) +
+                                  multi_mode6.BLOCKS[16:] + multi_mode6.BLOCKS[:16] + multi_mode6.RGBA)
+        wrong = subprocess.run([renderer, backend, "--check-bc7", shader, multi_swapped],
+                               capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError("Swapping multi-block mode-6 blocks must fail readback")
+        multi_mut = work / "bcpack-mode6-multiblock-mut.case"
+        mut_b1 = multi_mode6.BLOCKS[16:-1] + bytes([multi_mode6.BLOCKS[-1] ^ 0xf0])
+        multi_mut.write_bytes(struct.pack("<4sII", b"BC7C", 8, 4) +
+                              multi_mode6.BLOCKS[:16] + mut_b1 + multi_mode6.RGBA)
+        wrong = subprocess.run([renderer, backend, "--check-bc7", shader, multi_mut],
+                               capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch x=7 y=3" not in wrong.stderr.splitlines():
+            raise AssertionError(f"Mutating second block selector must fail at (7, 3): {wrong.stderr}")
         lower = work / "mip1.case"
         header, rows, expected = fixture(10, 9)
         lower.write_bytes(header + rows + expected)
