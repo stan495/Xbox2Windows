@@ -12,6 +12,8 @@
 #include "pso_compute_embedded.h"
 #include "pso_compute_stripped.h"
 
+extern "C" __declspec(dllimport) HRESULT WINAPI D3D12ConfigureVirtualMemoryX(const void* configuration);
+
 using Microsoft::WRL::ComPtr;
 using namespace std::literals;
 
@@ -63,7 +65,8 @@ bool export_checks()
     if (!desktop.load()) return false;
 
     unsigned found = 0;
-    for (const char* name : {"D3D12SerializeVersionedRootSignature", "D3D12CreateRootSignatureDeserializer"}) {
+    for (const char* name : {"D3D12SerializeVersionedRootSignature", "D3D12CreateRootSignatureDeserializer",
+                             "D3D12ConfigureVirtualMemoryX", "D3D12XboxCreateDevice"}) {
         FARPROC proc = GetProcAddress(shim, name);
         if (!proc) return false;
         HMODULE owner = nullptr;
@@ -304,6 +307,23 @@ bool warp_root_checks()
                 static_cast<unsigned long>(root_hr), static_cast<unsigned long>(pso_hr));
     return SUCCEEDED(pso_hr) && pipeline;
 }
+
+bool virtual_memory_checks()
+{
+    if (D3D12ConfigureVirtualMemoryX(nullptr) != E_INVALIDARG) {
+        return false;
+    }
+
+    struct Configuration {
+        std::uint32_t flags = 0;
+        std::uint32_t page_table_entries = 4;
+        std::uint64_t reserved[3] = {};
+    } config;
+    static_assert(sizeof(config) == 32);
+
+    const HRESULT hr = D3D12ConfigureVirtualMemoryX(&config);
+    return hr == S_OK;
+}
 }
 
 int main(int argc, char** argv)
@@ -321,6 +341,8 @@ int main(int argc, char** argv)
         passed = deserialize_checks();
     } else if (scenario == "warp_root"sv) {
         passed = warp_root_checks();
+    } else if (scenario == "virtual_memory"sv) {
+        passed = virtual_memory_checks();
     } else {
         return 2;
     }

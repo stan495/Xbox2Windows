@@ -67,3 +67,9 @@ extern "C" HRESULT WINAPI d3d12_xs_XboxCreateDevice(
     if (iid != __uuidof(ID3D12Device)) return E_NOINTERFACE;
     return D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, iid, device);
 }
+
+extern "C" HRESULT WINAPI d3d12_xs_ConfigureVirtualMemoryX(const void* configuration)
+{
+    if (!configuration) return E_INVALIDARG;
+    return S_OK;
+}
