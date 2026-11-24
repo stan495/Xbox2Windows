@@ -3584,6 +3584,37 @@ pending. The four opcodes remain unsupported by the AOT translator.
 Fractional mip thresholds, non-affine or entry-only coordinates, dynamic
 bias, alternate view shapes and `_cl` are outside the probe.
 
+### Native gfx1030 2D gather clamp probe
+
+The gather clamp probe covers `image_gather4_cl`, `image_gather4_b_cl`,
+`image_gather4_c_cl` and `image_gather4_c_b_cl`, each with and without a
+packed offset. It uses the gather bias probe's three-level texture and
+pixel ABI. The viewport and UV gradients target implicit LOD 1. An
+`image_get_lod` draw verifies that LOD before classifying the gathers.
+Each layout also draws its explicit-LOD gather at all three mips and
+compares every returned tap with the CPU reference.
+
+The unbiased cases use clamp values 0 and 2. The biased cases use clamp
+1 with biases +1 and -1. Together the four trials distinguish an upper
+bound, a lower bound, either bound applied before bias, and an ignored
+clamp. Mip, offset and comparison-predicate mutations check that the CPU
+inputs discriminate those behaviors.
+
+```sh
+python3 -B tests/pixel_gather_clamp_probe.py --binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+python3 -B tests/pixel_gather_clamp_probe.py --classify out/native-gather-clamp-readbacks
+```
+
+The first command emits the manifest, synthetic textures and shaders
+under `out/gfx1030-gather-clamp-probe/`. Use `--emit` to generate input
+files without LLVM. An external native gfx1030 graphics runner draws the
+29 programs using the bindings and interpolation setup in the manifest.
+Save each tightly packed RGBA32F result as `<stem>.rgba32f` in the
+readback directory. The classifier requires the LOD and explicit-mip
+controls to agree with their references and a single clamp model to
+explain all 16 trial readbacks. Native readback is pending. These eight
+forms have no AOT lowering or semantic coverage record.
+
 ### gfx1030 2D image stores
 
 `image_store`, `image_store_mip`, `image_store_pck` and `image_store_mip_pck`
