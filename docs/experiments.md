@@ -5459,6 +5459,33 @@ With registration, the callers' predicates accept GPU-intended memory and reject
 | `era_query_registry` | Null, empty and wrapping ranges are refused. Exact, front, back, containing and contained overlaps are refused, adjacent ranges are accepted, and unregistering needs the exact base. |
 | `era_query_short` | A 47-byte buffer returns 0 with `ERROR_BAD_LENGTH` and is left untouched. A 48-byte buffer succeeds without writing the tail byte. A null output returns `ERROR_BAD_LENGTH` at 47 bytes and `ERROR_NOACCESS` at 48 or 64 bytes, matching desktop `VirtualQueryEx`. |
 
+### gfx1030 2D comparison sampling
+
+The pixel profile also lowers `image_sample_c`, `image_sample_c_o`, and
+`image_sample_c_lz_o` on a 2D R32_FLOAT view with a matching comparison
+sampler and `dmask:0x1`. The contiguous address registers contain an optional
+packed XY offset, the compare reference, then U and V. The immediate offset
+uses the signed six-bit fields and DXIL range documented above. The implicit
+forms require whole-quad UVs and source sampler `MIN_LOD = MAX_LOD = 0`.
+Bind a desktop maximum LOD of zero or a one-mip view for these forms.
+The LOD-zero offset form uses `SampleCmpLevelZero` directly. The accepted
+point and bilinear filters, coordinate precision and reference range are
+those of the existing comparison sampler profile.
+
+An independent CPU reference clamps and compares the texture taps before
+interpolation. The translated DXIL draw compares every output channel at
+8×8 and 16×16 for point and bilinear sampling. The offset mutations replace
+`(1, -2)` with `(0, 0)` and must produce a pixel mismatch. LLVM 15 assembles
+and disassembles all three gfx1030 encodings and exercises the container CLI.
+
+```sh
+python3 -B tests/pixel_compare_sample_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+```powershell
+ctest --preset dev --no-tests=error -R '^pixel_aot_compare_sample_(warp|hardware)$' -V
+```
+
 ### Desktop xmem.dll
 
 `src/xmem_shim.cpp` builds `xmem.dll`, which exports the four functions the package DLLs import by name. The call shapes come from the observed call sites, not from a published header:

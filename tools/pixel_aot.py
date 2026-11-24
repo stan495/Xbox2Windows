@@ -228,6 +228,23 @@ DEPTH_COMPARE = ("NEVER", "LESS", "EQUAL", "LESS_EQUAL", "GREATER", "NOT_EQUAL",
 COMPARISON_FILTERS = {0: ("point", 0x80), 1: ("bilinear", 0x94)}
 
 
+def sample_offset_arg(reg, vector, sample_dest, known_ssa_bits):
+    if reg in sample_dest:
+        raise ValueError("Sample offset used before vmcnt wait")
+    value = vector.get(reg)
+    if not isinstance(value, str) or value not in known_ssa_bits:
+        raise ValueError("Sample offset must be a known packed integer word")
+    packed = known_ssa_bits[value]
+    # RDNA 2 packs signed six-bit X and Y at bits [5:0] and [13:8].
+    if packed & ~0x3f3f:
+        raise ValueError("Sample offset must be a canonical 2D offset word")
+    x = ((packed & 0x3f) ^ 0x20) - 0x20
+    y = (((packed >> 8) & 0x3f) ^ 0x20) - 0x20
+    if not (-8 <= x <= 7 and -8 <= y <= 7):
+        raise ValueError("Sample offset is outside the DXIL immediate range [-8, 7]")
+    return f", int2({x}, {y})"
+
+
 def comparison_sampler_state(words):
     """Decode the sampler descriptor fields that change an image_sample_c_lz result on a 2D texture.
 
@@ -3898,22 +3915,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             coord_regs = [f"v{n}" for n in coords]
             offset_arg = ""
             if has_offset:
-                offset_reg = coord_regs.pop(0)
-                if offset_reg in sample_dest:
-                    raise ValueError("Sample offset used before vmcnt wait")
-                value = vector.get(offset_reg)
-                if not isinstance(value, str) or value not in known_ssa_bits:
-                    raise ValueError("Sample offset must be a known packed integer word")
-                packed = known_ssa_bits[value]
-                # RDNA 2 packs signed six-bit X and Y at bits [5:0] and [13:8].
-                # Require a canonical 2D word and offsets representable in ps_6_0.
-                if packed & ~0x3f3f:
-                    raise ValueError("Sample offset must be a canonical 2D offset word")
-                x = ((packed & 0x3f) ^ 0x20) - 0x20
-                y = (((packed >> 8) & 0x3f) ^ 0x20) - 0x20
-                if not (-8 <= x <= 7 and -8 <= y <= 7):
-                    raise ValueError("Sample offset is outside the DXIL immediate range [-8, 7]")
-                offset_arg = f", int2({x}, {y})"
+                offset_arg = sample_offset_arg(coord_regs.pop(0), vector, sample_dest, known_ssa_bits)
             if any(reg not in vector for reg in coord_regs):
                 raise ValueError("Unsupported texture coordinate")
 
@@ -3968,14 +3970,18 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             vector_loads += 1
             vector[dst] = f"alu{i}"
             sample_dest[dst] = vector_loads
-        elif m := match(r"image_sample_c_lz (v\d+), (?:v\[(\d+):(\d+)\]|\[(v\d+), (v\d+), (v\d+)\]), "
+        elif m := match(r"(image_sample_c(?:_lz)?(?:_o)?) (v\d+), (?:v\[(\d+):(\d+)\]|\[(v\d+), (v\d+), (v\d+)\]), "
                         r"s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x1 dim:SQ_RSRC_IMG_2D"):
-            # Depth comparison at LOD zero. The RDNA2 address order puts the reference before the
-            # coordinates, so the operands are (reference, u, v), in one VGPR range or the NSA form.
-            dst, first, last, *nsa = m.groups()[:6]
-            image = registers(*m.groups()[6:8], 8)
-            state = registers(*m.groups()[8:10], 4)
-            address = ([f"v{n}" for n in registers(first, last, 3)] if first is not None else nsa)
+            # The optional packed offset precedes the reference, followed by the UV pair.
+            op, dst, first, last, *nsa = m.groups()[:7]
+            image = registers(*m.groups()[7:9], 8)
+            state = registers(*m.groups()[9:11], 4)
+            has_offset = op.endswith("_o")
+            explicit_zero = op.removesuffix("_o") == "image_sample_c_lz"
+            if first is None and op != "image_sample_c_lz":
+                raise ValueError("Comparison sample requires a contiguous address")
+            address = ([f"v{n}" for n in registers(first, last, 3 + has_offset)]
+                       if first is not None else nsa)
             if any(int(reg[1:]) > 255 for reg in (dst, *address)):
                 raise ValueError("Comparison sample VGPR out of range")
             if sampler is None or second_texture_offset is not None or sample_kind == "plain":
@@ -3987,6 +3993,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or descriptor != [("tex", j) for j in range(8)]
                     or [scalar.get(f"s{n}") for n in state] != list(sampler)):
                 raise ValueError("Unsupported image or sampler binding")
+            if not explicit_zero and sampler[1] & 0xfff000:
+                raise ValueError("Implicit comparison sampling requires MAX_LOD 0")
+            offset_arg = sample_offset_arg(address.pop(0), vector, sample_dest, known_ssa_bits) if has_offset else ""
+            if not explicit_zero and any(vector.get(reg) not in quad_values for reg in address[1:]):
+                raise ValueError("Implicit comparison sampling requires coordinates with quad provenance")
             if sample_kind is None:
                 lines[lines.index(SAMPLED_RESOURCES)] = comparison_resources(comparison_sampler_state(sampler))
             sample_kind = "comparison"
@@ -3998,7 +4009,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 if not isinstance(value, str) or not (value in quad_values or value.startswith(("sample", "alu", "params"))):
                     raise ValueError("Unsupported comparison sample operand")
             reference, u, v = values
-            lines.append(f"    float sample{i} = tex.SampleCmpLevelZero(samp, float2({u}, {v}), {reference});")
+            method = "SampleCmpLevelZero" if explicit_zero else "SampleCmp"
+            lines.append(f"    float sample{i} = tex.{method}(samp, float2({u}, {v}), {reference}{offset_arg});")
             samples += 1
             vector_loads += 1
             vector[dst] = f"sample{i}"
