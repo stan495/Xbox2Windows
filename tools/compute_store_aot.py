@@ -974,14 +974,20 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Unsupported read address")
             vector.pop(dst, None)
             loading[dst] = ("source", address)
-        elif m := re.fullmatch(r"(?:buffer_store_dword(?:x([234]))?|tbuffer_store_format_(?P<channels>x|xy|xyz|xyzw)) "
+        elif m := re.fullmatch(r"(?:buffer_store_dword(?:x([234]))?|"
+                               r"tbuffer_store_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
                                r"(v\d+|v\[\d+:\d+\]), (off|v\d+|v\[\d+:\d+\]), s\[(\d+):(\d+)\], 0"
-                               r"(?(channels) format:\[(?P<format>BUF_FMT_(?:32_){1,4}UINT)\])"
+                               r"(?(channels) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
                                r"(?P<idxen> idxen)?(?P<offen> offen)?(?: offset:(?P<offset>\d+))?", line):
             channels = m["channels"]
-            count = len(channels) if channels else int(m[1] or 1)
+            packed = channels is not None and channels.startswith("d16_")
+            components = len(channels.removeprefix("d16_")) if channels else int(m[1] or 1)
+            partial = packed and components % 2 != 0
+            count = (components + 1) // 2 if packed else components
             idxen, offen = m["idxen"], m["offen"]
-            if channels and (cpu != "gfx1030" or not idxen or offen or m["format"] != f"BUF_FMT_{'32_' * count}UINT"):
+            format_components = 4 if packed and components == 3 else components
+            fmt = f"BUF_FMT_{('16_' if packed else '32_') * format_components}UINT"
+            if channels and (cpu != "gfx1030" or not idxen or offen or m["format"] != fmt):
                 raise ValueError("Unsupported typed buffer store format, target or address mode")
             first, *last = map(int, re.findall(r"\d+", m[3]))
             base, high = int(m[5]), int(m[6])
@@ -1056,7 +1062,13 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             values = [vector.get(reg) for reg in range(first, first + count)]
             if not all(is_word(value) for value in values):
                 raise ValueError("Store data is not a known word")
-            words = ", ".join(map(hlsl_word, values))
+            words = list(map(hlsl_word, values))
+            if partial:
+                # Reserve the entire final DWORD, including the untouched high half. The indexed
+                # layout, aligned stride and overlap checks give that word a single writer.
+                final_address = address if count == 1 else f"{address} + 4u"
+                words[-1] = f"((outputData.Load({final_address}) & 0xffff0000u) | ({words[-1]} & 0xffffu))"
+            words = ", ".join(words)
             arg = words if count == 1 else f"uint{count}({words})"
             stores.append(f"    outputData.Store{count if count > 1 else ''}({address}, {arg});")
         else:

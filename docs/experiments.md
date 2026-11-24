@@ -2817,6 +2817,17 @@ all 320 UAV words for one and two groups. An otherwise valid translation
 shifted one DWORD earlier must mismatch at word 0. The LLVM 15 binary
 check assembles and decodes each opcode before repeating the lowering check.
 
+The four `tbuffer_store_format_d16_*` forms accept 16-bit UINT components
+(`xyz` uses the four-component format). Consecutive pairs are already in
+memory byte order, first component in the low half. For an odd count, a
+read-modify-write preserves the final DWORD's high half. The usual
+alignment, stride, and overlap checks reserve the entire rounded-up span.
+The caller must dispatch along the indexed axis only and bind a UAV with
+no concurrent access by other work. Each affected DWORD then belongs to
+one invocation. The fixtures check both halves and untouched words;
+swapping the first word's halves or clearing the preserved half must
+cause a readback mismatch.
+
 ```powershell
 cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_store_(warp|hardware)$' -V

@@ -2675,10 +2675,13 @@ MTBUF_STORE_WORDS = (0x01234567, 0x89abcdef, 0x76543210, 0xfedcba98)
 
 
 def mtbuf_store_cases():
-    for count in range(1, 5):
-        op = "tbuffer_store_format_" + "xyzw"[:count]
+    shapes = [(components, packed) for packed in (False, True) for components in range(1, 5)]
+    for components, packed in shapes:
+        count = (components + 1) // 2 if packed else components
+        op = "tbuffer_store_format_" + ("d16_" if packed else "") + "xyzw"[:components]
         data = "v10" if count == 1 else f"v[10:{9 + count}]"
-        fmt = f"BUF_FMT_{'32_' * count}UINT"
+        format_components = 4 if packed and components == 3 else components
+        fmt = f"BUF_FMT_{('16_' if packed else '32_') * format_components}UINT"
         store = f"{op} {data}, v8, s[20:23], 0 format:[{fmt}] idxen offset:4"
         lines = ["s_mov_b32 s12, s7", "s_mov_b32 s13, 0", "s_load_dwordx4 s[20:23], s[12:13], 0x30",
                  "v_lshl_add_u32 v8, s11, 5, v0", "s_waitcnt lgkmcnt(0)"]
@@ -2707,36 +2710,53 @@ def mtbuf_store_draw(directory, compiler, renderer, backend):
     for count, lines, binding in mtbuf_store_cases():
         store = lines[-2]
         op = store.split()[0]
+        packed = "_d16_" in op
+        partial = packed and op.endswith(("_x", "_xyz"))
         rejects("Unsupported typed buffer store", aot.lower, lines, 32, **(binding | {"cpu": "gfx1013"}))
         rejects("Unsupported typed buffer store", aot.lower, variant(lines, ("idxen", "offen")), 32, **binding)
-        wrong_format = "32_32_UINT" if count == 1 else "32_UINT"
+        fmt = store.split("format:[")[1].split("]")[0]
+        wrong_format = "BUF_FMT_32_32_UINT" if fmt == "BUF_FMT_32_UINT" else "BUF_FMT_32_UINT"
         rejects("Unsupported typed buffer store", aot.lower,
-                variant(lines, (f"{'32_' * count}UINT", wrong_format)), 32, **binding)
+                variant(lines, (fmt, wrong_format)), 32, **binding)
         rejects("Unverified raw UAV store", aot.lower,
                 variant(lines, ("s_waitcnt lgkmcnt(0)", "")), 32, **binding)
         rejects("Unsupported store address", aot.lower, lines, 32, **(binding | {"stride": 4 * count}))
         rejects("Overlapping raw UAV stores", aot.lower,
-                variant(lines, (store, store + "\nbuffer_store_dword v10, v8, s[20:23], 0 idxen offset:4")),
+                variant(lines, (store, store + f"\nbuffer_store_dword v10, v8, s[20:23], 0 idxen offset:{4 * count}")),
                 32, **binding)
-        src.write_text(aot.lower(lines, 32, **binding), encoding="ascii")
+        source = aot.lower(lines, 32, **binding)
+        src.write_text(source, encoding="ascii")
         subprocess.run(compile, check=True)
         for groups in (1, 2):
             words = [SENTINEL] * 320
             for gid in range(groups * 32):
                 start = gid * (count + 1) + 1
                 words[start:start + count] = [word ^ gid for word in MTBUF_STORE_WORDS[:count]]
+                if partial:
+                    last = start + count - 1
+                    words[last] = (SENTINEL & 0xffff0000) | (words[last] & 0xffff)
             case.write_bytes(struct.pack("<321I", groups, *words))
             result = subprocess.run(run)
             if result.returncode:
                 return result.returncode
-        # A legal translation shifted one DWORD early must clobber the record padding.
-        src.write_text(aot.lower(variant(lines, (store, store.removesuffix(" offset:4"))), 32, **binding),
-                       encoding="ascii")
-        subprocess.run(compile, check=True)
-        bad = subprocess.run(run, capture_output=True, text=True)
-        if bad.returncode != 1 or "word=0 expected=" not in bad.stderr:
-            raise AssertionError(f"{op}: incorrect store offset escaped detection\n{bad.stderr}")
-        print(bad.stderr, end="")
+        if packed:
+            # Swap the low and high channel in the first VGPR only.
+            swapped = "v_lshlrev_b32_e32 v22, 16, v10\nv_lshrrev_b32_e32 v23, 16, v10\nv_or_b32_e32 v10, v22, v23"
+            mutant, mismatch = variant(lines, (store, swapped + "\n" + store)), 1
+        else:
+            # A legal translation shifted one DWORD early must clobber the record padding.
+            mutant, mismatch = variant(lines, (store, store.removesuffix(" offset:4"))), 0
+        mutants = [(aot.lower(mutant, 32, **binding), mismatch)]
+        if partial:
+            mutants.append((source.replace("& 0xffff0000u", "& 0u"), count))
+        for changed, mismatch in mutants:
+            assert changed != source
+            src.write_text(changed, encoding="ascii")
+            subprocess.run(compile, check=True)
+            bad = subprocess.run(run, capture_output=True, text=True)
+            if bad.returncode != 1 or f"word={mismatch} expected=" not in bad.stderr:
+                raise AssertionError(f"{op}: incorrect store escaped detection\n{bad.stderr}")
+            print(bad.stderr, end="")
         accepted.append(op)
     if record := os.environ.get("FORM_COVERAGE_RECORD"):
         path = Path(record)
