@@ -22,14 +22,15 @@ static_assert(constants_offset % alignment == 0);
 constexpr UINT sentinel = 0xc5c5c5c5u;
 constexpr std::array<UINT, 16> constants{count, 73, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19, 23, 29};
 constexpr UINT uavs = 13, srvs = 21;
-// The image case header packs the dispatch count and a format selector. The payload
+// The image case header packs the dispatch count and a format/capability selector. The payload
 // carries raw texels, one word each for RGBA8 and scalar R32, or four for RGBA32.
 constexpr UINT texture_rgba8_flag = 1u << 24;
 constexpr UINT texture_atomic_uint_flag = 1u << 25;
 constexpr UINT texture_atomic_sint_minmax_flag = 1u << 26;
 constexpr UINT texture_atomic_uint_minmax_flag = 1u << 27;
+constexpr UINT texture_atomic_exchange_flag = 1u << 28;
 constexpr UINT texture_atomic_mask = texture_atomic_uint_flag | texture_atomic_sint_minmax_flag |
-                                     texture_atomic_uint_minmax_flag;
+                                     texture_atomic_uint_minmax_flag | texture_atomic_exchange_flag;
 constexpr UINT texture_format_mask = texture_rgba8_flag | texture_atomic_mask;
 constexpr UINT texture_width = 32, texture_height = 8, texture_channels = 4;
 constexpr UINT texture_mip_levels = 3;
@@ -435,6 +436,11 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     case texture_atomic_uint_minmax_flag:
         format = DXGI_FORMAT_R32_UINT;
         required = D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX;
+        break;
+    case texture_atomic_exchange_flag:
+        format = DXGI_FORMAT_R32_UINT;
+        required = D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_EXCHANGE |
+                   D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE;
         break;
     default: throw std::runtime_error("Invalid compute image store format selector");
     }

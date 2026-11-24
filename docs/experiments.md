@@ -3419,8 +3419,8 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_mimg_store_(packed_)?
 ### gfx1030 2D integer image atomics
 
 The compute store profile lowers one unguarded 32-bit `image_atomic_*`
-instruction per `gfx1030` shader, with `glc` clear, one 32-bit data VGPR,
-a contiguous pair of 32-bit X/Y coordinate VGPRs, and optional `unorm`.
+instruction per `gfx1030` shader, with `glc` clear, a contiguous pair of
+32-bit X/Y coordinate VGPRs, and optional `unorm`.
 The caller supplies in-bounds coordinates and declares a scalar integer
 2D image with identity channel selectors and binds its matching UAV to
 `u0` at mip 0. The eight resource words must be loaded from the declared table
@@ -3436,21 +3436,31 @@ this profile. See sections 8.2 and 12.16 of the
 | `and`, `or`, `xor` | Matching `Interlocked` bitwise intrinsic, `R32_UINT` |
 | `smin`, `smax` | Signed `InterlockedMin` or `InterlockedMax`, `R32_SINT`, reinterpret the operand with `asint` |
 | `umin`, `umax` | Unsigned `InterlockedMin` or `InterlockedMax`, `R32_UINT` |
+| `swap` | `InterlockedExchange`, `R32_UINT`, discard the original value |
+| `cmpswap` | `InterlockedCompareStore`, `R32_UINT`, compare against `VDATA+1` and store `VDATA` on a match |
 
-`DMASK` is `0x1`. The
+All forms use one 32-bit data VGPR with `DMASK=0x1` except `cmpswap`, which
+requires exactly two contiguous, known 32-bit data VGPRs with `DMASK=0x3`.
+The exchange controls reject invalid compare data tuples and masks and
+reject `glc`, `dlc`, `slc`, `a16`, `d16`, `tfe`, `lwe` and `r128` on both forms. The
 [format support query](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_format_support2)
 gates the typed atomic operations for each view. An unavailable capability
-returns 77. Min/max has its own suite and checks the signed or unsigned
-min/max capability for each dispatch; it does not gate arithmetic or bitwise
-tests. The GPU fixture compares 336 words over all three mips of a
-32x8 texture per case, including untouched words. One- and two-group draws
+returns 77. Min/max checks its signed or unsigned capability per dispatch.
+The exchange suite requires only `UAV_ATOMIC_EXCHANGE` and
+`UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE` on `R32_UINT`. Neither suite
+adds requirements to the arithmetic and bitwise tests. The GPU fixture
+compares 336 words over all three mips of a 32x8 texture per case, including
+untouched words. One- and two-group draws
 exercise high-bit inputs, arithmetic wraparound and two lanes adding to
 each texel in the contended add case. Lowering subtract as add must fail
 first at mip 0, word 32. The min/max fixture checks both same-sign and
 opposite-sign pairs with an independent CPU comparison. For each form,
 switching the comparison's signedness and binding the matching UAV must fail
-first at mip 0, word 33. Only a complete suite records coverage. Returning
-atomics, exchange, compare-exchange, counters and float atomics are not lowered.
+first at mip 0, word 33. The exchange fixture covers matched and unmatched
+compares at both group counts. Reversing the HLSL comparison and replacement
+arguments in the two-group control must fail first at
+`mip=0 word=32 expected=a5a51f3f actual=fffffff0`. Only a complete suite
+records coverage. Returning atomics, counters and float atomics are not lowered.
 
 The LLVM 15 test assembles, disassembles and translates the cases through the
 synthetic-container CLI. The standalone compile modes check the generated
@@ -3464,8 +3474,9 @@ $env:TMP = (Resolve-Path out).Path
 $env:TEMP = $env:TMP
 python -B tests/compute_store_check.py compile-mimg-atomic-integer $Dxc
 python -B tests/compute_store_check.py compile-mimg-atomic-minmax $Dxc
+python -B tests/compute_store_check.py compile-mimg-atomic-exchange $Dxc
 cmake --build --preset dev --target offscreen_check
-ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_mimg_atomic_(integer|minmax)_(warp|hardware)$' -V
+ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_mimg_atomic_(integer|minmax|exchange)_(warp|hardware)$' -V
 ```
 
 ```bash

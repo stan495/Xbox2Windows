@@ -3331,11 +3331,11 @@ def binary(directory, assembler, objcopy, library):
     gfx1030_binary(directory, assembler, objcopy, library,
                    [(name, lines, MIMG_BINDING) for name, _, _, _, _, lines in mimg_resinfo_cases()],
                    "image_get_resinfo", group=(8, 8, 1))
-    for minmax in (False, True):
-        mimg_atomic_controls(minmax=minmax)
+    for suite in MIMG_ATOMIC_OPS:
+        mimg_atomic_controls(suite=suite)
         gfx1030_binary(directory, assembler, objcopy, library,
                        [(f"image_atomic_{name}", lines, binding)
-                        for name, _, lines, binding in mimg_atomic_cases(minmax=minmax)],
+                        for name, _, lines, binding in mimg_atomic_cases(suite=suite)],
                        "image_atomic_", group=MIMG_STORE_GROUP)
     mimg_store_controls()
     gfx1030_binary(directory, assembler, objcopy, library,
@@ -4803,13 +4803,18 @@ def mimg_resinfo_draw(directory, compiler, renderer, backend):
 
 MIMG_ATOMIC_UINT_FLAG = 1 << 25
 MIMG_ATOMIC_MINMAX_FLAGS = {"s": 1 << 26, "u": 1 << 27}
-MIMG_ATOMIC_MINMAX_OPS = ("smin", "smax", "umin", "umax")
+MIMG_ATOMIC_EXCHANGE_FLAG = 1 << 28
+MIMG_ATOMIC_OPS = {"integer": ("add", "sub", "and", "or", "xor"),
+                   "minmax": ("smin", "smax", "umin", "umax"), "exchange": ("swap", "cmpswap")}
 MIMG_ATOMIC_BEFORE = (0xfffffff0, 0x7ffffff0, 0x20, 0x80000000)
 MIMG_ATOMIC_VALUE = 0x80000011
+MIMG_ATOMIC_COMPARE = MIMG_ATOMIC_BEFORE[0]
+MIMG_ATOMIC_REPLACEMENT = 0xa5a51f3f
+MIMG_ATOMIC_FORBIDDEN_FLAGS = ("glc", "dlc", "slc", "a16", "d16", "tfe", "lwe", "r128")
 
 
-def mimg_atomic_cases(*, minmax=False):
-    for op in MIMG_ATOMIC_MINMAX_OPS if minmax else ("add", "sub", "and", "or", "xor"):
+def mimg_atomic_cases(*, suite="integer"):
+    for op in MIMG_ATOMIC_OPS[suite]:
         image_format = "R32_SINT" if op in ("smin", "smax") else "R32_UINT"
         binding = MIMG_STORE_BINDING | {"image_uav_mip": 0, "image_format": image_format}
         for contended in ((False, True) if op == "add" else (False,)):
@@ -4819,17 +4824,23 @@ def mimg_atomic_cases(*, minmax=False):
                      "v_mov_b32_e32 v9, 1" if contended else "v_lshl_add_u32 v9, s11, 1, v1"]
             if not contended:
                 lines.append("v_add_nc_u32_e32 v9, 1, v9")
-            lines.append(f"v_mov_b32_e32 v14, {MIMG_ATOMIC_VALUE:#x}")
-            flags = " unorm" if contended else ""
+            if op == "cmpswap":
+                lines += [f"v_mov_b32_e32 v14, {MIMG_ATOMIC_REPLACEMENT:#x}",
+                          f"v_mov_b32_e32 v15, {MIMG_ATOMIC_COMPARE:#x}"]
+                data, mask = "v[14:15]", 3
+            else:
+                lines.append(f"v_mov_b32_e32 v14, {MIMG_ATOMIC_VALUE:#x}")
+                data, mask = "v14", 1
+            flags = " unorm" if contended or op == "cmpswap" else ""
             lines += ["s_waitcnt lgkmcnt(0)",
-                      f"image_atomic_{op} v14, v[8:9], s[24:31] dmask:0x1 dim:SQ_RSRC_IMG_2D{flags}",
+                      f"image_atomic_{op} {data}, v[8:9], s[24:31] dmask:0x{mask:x} dim:SQ_RSRC_IMG_2D{flags}",
                       "s_waitcnt_vscnt null, 0x0", "s_endpgm"]
             yield op + ("_contended" if contended else ""), contended, lines, binding
 
 
-def mimg_atomic_controls(*, minmax=False):
-    cases = {op: (lines, binding) for op, _, lines, binding in mimg_atomic_cases(minmax=minmax)}
-    base_op = "smin" if minmax else "add"
+def mimg_atomic_controls(*, suite="integer"):
+    cases = {op: (lines, binding) for op, _, lines, binding in mimg_atomic_cases(suite=suite)}
+    base_op = MIMG_ATOMIC_OPS[suite][0]
     lines, binding = cases[base_op]
     instruction = lines[-3]
     for changed, diagnostic in (
@@ -4837,15 +4848,14 @@ def mimg_atomic_controls(*, minmax=False):
         (instruction.replace("dmask:0x1", "dmask:0x3"), "Unverified image atomic data range or mask"),
         (instruction.replace("v14", "v256"), "Unverified image atomic data range or mask"),
         (instruction.replace("v14", "v15"), "Unverified image atomic data"),
-        (instruction.replace("v14", "v[14:15]"), "Unsupported compute instruction"),
+        (instruction.replace("v14", "v[14:15]"), "Unverified image atomic data range or mask"),
         (instruction.replace("v[8:9]", "v[8:10]"), "Unverified image atomic coordinates"),
         (instruction.replace("v[8:9]", "v[9:10]"), "Unverified image atomic coordinates"),
         (instruction.replace("s[24:31]", "s[28:35]"), "Unverified image atomic descriptor"),
         (instruction + "\n" + instruction, "Unsupported image atomic target or binding"),
         (instruction.replace("IMG_2D", "IMG_2D_ARRAY"), "Unsupported compute instruction"),
         (instruction.replace("v[8:9]", "[v8, v9]"), "Unsupported compute instruction"),
-        *((instruction + flag, "Unsupported compute instruction")
-          for flag in (" glc", " dlc", " slc", " a16", " d16", " tfe", " lwe", " r128")),
+        *((f"{instruction} {flag}", "Unsupported compute instruction") for flag in MIMG_ATOMIC_FORBIDDEN_FLAGS),
     ):
         rejects(diagnostic, aot.lower, variant(lines, (instruction, changed)), MIMG_STORE_GROUP, **binding)
     rejects("Unverified image atomic descriptor", aot.lower,
@@ -4855,7 +4865,7 @@ def mimg_atomic_controls(*, minmax=False):
     rejects("Invalid image UAV binding", aot.lower, lines, MIMG_STORE_GROUP,
             **(binding | {"image_uav_mip": 1}))
     srv_binding = {key: value for key, value in binding.items() if key != "image_uav_mip"}
-    rejects("Invalid or overlapping image descriptor binding" if minmax else "Unsupported image atomic target or binding",
+    rejects("Invalid or overlapping image descriptor binding" if suite == "minmax" else "Unsupported image atomic target or binding",
             aot.lower, lines, MIMG_STORE_GROUP,
             **(srv_binding | {"descriptor_offset": MIMG_BINDING["descriptor_offset"]}))
     msaa = "image_msaa_load v[14:17], v[8:10], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D_MSAA unorm"
@@ -4866,23 +4876,45 @@ def mimg_atomic_controls(*, minmax=False):
         wrong_format = "R32_UINT" if case_binding["image_format"] == "R32_SINT" else "R32_SINT"
         rejects("Unsupported image atomic target or binding", aot.lower, case, MIMG_STORE_GROUP,
                 **(case_binding | {"image_format": wrong_format}))
-    for op in ("swap", "cmpswap", "inc", "dec", "fcmpswap", "fmin", "fmax"):
+    for op in ("inc", "dec", "fcmpswap", "fmin", "fmax"):
         rejects("Unsupported compute instruction", aot.lower,
                 variant(lines, ("image_atomic_" + base_op, "image_atomic_" + op)), MIMG_STORE_GROUP, **binding)
     rejects("Unsupported image store target", aot.lower,
             variant(lines, ("image_atomic_" + base_op, "image_store")), MIMG_STORE_GROUP, **binding)
+    if suite == "exchange":
+        lines, binding = cases["cmpswap"]
+        instruction = lines[-3]
+        for operand in ("v14", "v[14:14]", "v[14:16]", "v[15:14]", "v[255:256]"):
+            rejects("Unverified image atomic data range or mask", aot.lower,
+                    variant(lines, ("v[14:15]", operand)), MIMG_STORE_GROUP, **binding)
+        for mask in (0, 1, 2, 5, 0xf):
+            rejects("Unverified image atomic data range or mask", aot.lower,
+                    variant(lines, ("dmask:0x3", f"dmask:0x{mask:x}")), MIMG_STORE_GROUP, **binding)
+        for reg in ("v14", "v15"):
+            missing = [line for line in lines if not line.startswith(f"v_mov_b32_e32 {reg},")]
+            rejects("Unverified image atomic data", aot.lower, missing, MIMG_STORE_GROUP, **binding)
+        for flag in MIMG_ATOMIC_FORBIDDEN_FLAGS:
+            rejects("Unsupported compute instruction", aot.lower,
+                    variant(lines, (instruction, f"{instruction} {flag}")), MIMG_STORE_GROUP, **binding)
 
 
-def mimg_atomic_reference(op, contended, groups):
+def mimg_atomic_reference(op, contended, groups, *, compare_store=(MIMG_ATOMIC_COMPARE, MIMG_ATOMIC_REPLACEMENT)):
     value = MIMG_ATOMIC_VALUE
-    if op in MIMG_ATOMIC_MINMAX_OPS:
+    before_words = MIMG_ATOMIC_BEFORE
+    if op == "cmpswap":
+        # Seed both operands so reversing them also changes a previously unmatched texel.
+        before_words = (MIMG_ATOMIC_COMPARE, MIMG_ATOMIC_REPLACEMENT, *before_words[2:])
+        compare, replacement = compare_store
+        update = lambda old: replacement if old == compare else old
+    elif op in MIMG_ATOMIC_OPS["minmax"]:
         # Flipping the sign bit maps two's-complement order to unsigned order.
         key = (lambda word: word ^ 0x80000000) if op[0] == "s" else None
         choose = min if op[1:] == "min" else max
         update = lambda old: choose(old, value, key=key)
     else:
         update = {"add": lambda old: old + value, "sub": lambda old: old - value,
-                  "and": lambda old: old & value, "or": lambda old: old | value, "xor": lambda old: old ^ value}[op]
+                  "and": lambda old: old & value, "or": lambda old: old | value, "xor": lambda old: old ^ value,
+                  "swap": lambda old: value}[op]
     initial, expected = [], []
     for level in range(3):
         for y in range(TEXTURE_HEIGHT >> level):
@@ -4890,7 +4922,7 @@ def mimg_atomic_reference(op, contended, groups):
                 before = 0xc0000000 | (level << 20) | (y << 12) | x
                 after = before
                 if level == 0 and x < groups * MIMG_STORE_GROUP[0] and y in ((1,) if contended else (1, 2)):
-                    before = MIMG_ATOMIC_BEFORE[(x + y - 1) % len(MIMG_ATOMIC_BEFORE)]
+                    before = before_words[(x + y - 1) % len(before_words)]
                     after = update(before)
                     if contended:
                         after = update(after)
@@ -4899,24 +4931,30 @@ def mimg_atomic_reference(op, contended, groups):
     return initial, expected
 
 
-def mimg_atomic_integer(directory, compiler, renderer=None, backend=None, *, minmax=False):
-    mimg_atomic_controls(minmax=minmax)
+def mimg_atomic_integer(directory, compiler, renderer=None, backend=None, *, suite="integer"):
+    mimg_atomic_controls(suite=suite)
     record_path = os.environ.get("FORM_COVERAGE_RECORD") if renderer else None
     record = Path(record_path) if record_path else None
     if record:
         record.unlink(missing_ok=True)
     completed = set()
-    for name, contended, lines, binding in mimg_atomic_cases(minmax=minmax):
+    for name, contended, lines, binding in mimg_atomic_cases(suite=suite):
         src, cso, case = (directory / f"image_atomic_{name}.{ext}" for ext in ("hlsl", "cso", "case"))
         code = aot.lower(lines, MIMG_STORE_GROUP, **binding)
         src.write_text(code, encoding="ascii")
         compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
         subprocess.run(compile_shader, check=True)
         op = name.removesuffix("_contended")
-        flag = MIMG_ATOMIC_MINMAX_FLAGS[op[0]] if minmax else MIMG_ATOMIC_UINT_FLAG
+        flag = {"integer": MIMG_ATOMIC_UINT_FLAG, "exchange": MIMG_ATOMIC_EXCHANGE_FLAG,
+                "minmax": MIMG_ATOMIC_MINMAX_FLAGS.get(op[0])}[suite]
         for groups in (1, 2):
             initial, expected = mimg_atomic_reference(op, contended, groups)
             assert len(initial) == len(expected) == 336 and initial != expected
+            if op == "cmpswap":
+                first = TEXTURE_WIDTH
+                assert initial[first:first + 3] == [MIMG_ATOMIC_COMPARE, MIMG_ATOMIC_REPLACEMENT, 0x20]
+                assert expected[first:first + 3] == [MIMG_ATOMIC_REPLACEMENT, MIMG_ATOMIC_REPLACEMENT, 0x20]
+                assert sum(a != b for a, b in zip(initial, expected, strict=True)) == 2 * groups
             if renderer:
                 dispatch = groups | flag
                 case.write_bytes(struct.pack("<674I", dispatch, 0, *initial, *expected))
@@ -4932,7 +4970,18 @@ def mimg_atomic_integer(directory, compiler, renderer=None, backend=None, *, min
             control = "wrong atomic operand"
             assert code.count(correct) == 1
             mutant = code.replace(correct, wrong)
-        elif minmax:
+        elif op == "cmpswap":
+            compare, replacement = f"{MIMG_ATOMIC_COMPARE:#010x}u", f"{MIMG_ATOMIC_REPLACEMENT:#010x}u"
+            correct, wrong = f", {compare}, {replacement});", f", {replacement}, {compare});"
+            assert code.count("InterlockedCompareStore(") == code.count(correct) == 1
+            mutant = code.replace(correct, wrong)
+            _, wrong_expected = mimg_atomic_reference(
+                op, contended, groups, compare_store=(MIMG_ATOMIC_REPLACEMENT, MIMG_ATOMIC_COMPARE))
+            first = next(i for i, (a, b) in enumerate(zip(expected, wrong_expected, strict=True)) if a != b)
+            assert first == TEXTURE_WIDTH
+            mismatch = f"mip=0 word={first} expected={expected[first]:08x} actual={wrong_expected[first]:08x}"
+            control = "reversed compare and replacement"
+        elif suite == "minmax":
             signed = op[0] == "s"
             other = "u" if signed else "s"
             decl, wrong_decl = ("int", "uint") if signed else ("uint", "int")
@@ -4954,7 +5003,7 @@ def mimg_atomic_integer(directory, compiler, renderer=None, backend=None, *, min
             subprocess.run(compile_shader, check=True)
             if renderer:
                 bad = subprocess.run(run, capture_output=True, text=True)
-                if minmax and bad.returncode == 77:
+                if suite == "minmax" and bad.returncode == 77:
                     print(bad.stdout, end="")
                     print(bad.stderr, end="", file=sys.stderr)
                     return 77
@@ -5647,8 +5696,10 @@ if __name__ == "__main__":
                  "draw-mimg-store": mimg_store_draw,
                  "compile-mimg-atomic-integer": lambda d, compiler: mimg_atomic_integer(d, compiler),
                  "draw-mimg-atomic-integer": mimg_atomic_integer,
-                 "compile-mimg-atomic-minmax": lambda d, compiler: mimg_atomic_integer(d, compiler, minmax=True),
-                 "draw-mimg-atomic-minmax": lambda d, *a: mimg_atomic_integer(d, *a, minmax=True),
+                 "compile-mimg-atomic-minmax": lambda d, compiler: mimg_atomic_integer(d, compiler, suite="minmax"),
+                 "draw-mimg-atomic-minmax": lambda d, *a: mimg_atomic_integer(d, *a, suite="minmax"),
+                 "compile-mimg-atomic-exchange": lambda d, compiler: mimg_atomic_integer(d, compiler, suite="exchange"),
+                 "draw-mimg-atomic-exchange": lambda d, *a: mimg_atomic_integer(d, *a, suite="exchange"),
                  "draw-mimg-packed-store": lambda d, *a: mimg_store_draw(d, *a, packed=True),
                  "draw-ds-route": ds_draw,
                  "draw-lds-qword": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_QWORD_CASES),

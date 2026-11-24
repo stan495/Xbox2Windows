@@ -99,7 +99,7 @@ MUBUF_ATOMIC_METHODS = {
     "swap": "Exchange", "cmpswap": "CompareExchange",
 }
 
-IMAGE_ATOMIC_OPS = "add|sub|and|or|xor|smin|smax|umin|umax"
+IMAGE_ATOMIC_OPS = "add|sub|and|or|xor|smin|smax|umin|umax|swap|cmpswap"
 IMAGE_ATOMIC_TYPES = {"R32_UINT": "uint", "R32_SINT": "int"}
 
 
@@ -1227,15 +1227,19 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 vector.pop(reg, None)
                 loading[reg] = ("alu", name)
             image_step_count += 1
-        elif m := re.fullmatch(rf"image_atomic_(?P<op>{IMAGE_ATOMIC_OPS}) v(?P<data>\d+), "
+        elif m := re.fullmatch(rf"image_atomic_(?P<op>{IMAGE_ATOMIC_OPS}) "
+                               r"v(?:(?P<single>\d+)|\[(?P<first>\d+):(?P<last>\d+)\]), "
                                r"v\[(?P<x>\d+):(?P<y>\d+)\], s\[(?P<base>\d+):(?P<high>\d+)\] "
                                r"dmask:0x(?P<mask>[0-9a-f]+) dim:SQ_RSRC_IMG_2D(?: unorm)?", line):
             op = m["op"]
             signed = op in ("smin", "smax")
             if image_atomic_type != ("int" if signed else "uint") or guard_span is not None or stores:
                 raise ValueError("Unsupported image atomic target or binding")
-            data = int(m["data"])
-            if int(m["mask"], 16) != 1 or data > 255:
+            compare_swap = op == "cmpswap"
+            data = int(m["single"] or m["first"])
+            if (int(m["mask"], 16) != (3 if compare_swap else 1) or data + int(compare_swap) > 255
+                    or (compare_swap and (m["last"] is None or int(m["last"]) != data + 1))
+                    or (not compare_swap and m["single"] is None)):
                 raise ValueError("Unverified image atomic data range or mask")
             base, high = int(m["base"]), int(m["high"])
             if (high != base + 7 or base % 4 or pending.intersection(range(base, high + 1))
@@ -1246,16 +1250,23 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             coords = [vector.get(reg) for reg in (x, y)]
             if y != x + 1 or y > 255 or not all(map(is_word, coords)):
                 raise ValueError("Unverified image atomic coordinates")
-            source = vector.get(data)
-            if not is_word(source):
+            sources = [vector.get(data + index) for index in range(1 + compare_swap)]
+            if not all(map(is_word, sources)):
                 raise ValueError("Unverified image atomic data")
             destination = f"outputData[uint2({', '.join(map(hlsl_word, coords))})]"
-            value = hlsl_word(source)
-            if op == "sub":
-                value = f"(0u - {value})"
-            elif signed:
-                value = f"asint({value})"
-            stores.append(f"    Interlocked{MUBUF_ATOMIC_METHODS[op]}({destination}, {value});")
+            value = hlsl_word(sources[0])
+            if compare_swap:
+                # RDNA stores VDATA on a match against VDATA+1; HLSL takes the comparison first.
+                stores.append(f"    InterlockedCompareStore({destination}, {hlsl_word(sources[1])}, {value});")
+            else:
+                if op == "swap":
+                    stores.append("    uint discardedOldValue;")
+                    value += ", discardedOldValue"
+                elif op == "sub":
+                    value = f"(0u - {value})"
+                elif signed:
+                    value = f"asint({value})"
+                stores.append(f"    Interlocked{MUBUF_ATOMIC_METHODS[op]}({destination}, {value});")
         elif m := re.fullmatch(r"image_(?P<kind>load|store|get_resinfo)(?P<mip>_mip)?(?P<packed>_pck(?:_sgn)?)? "
                                r"(?P<data>v\d+|v\[\d+:\d+\]), (?P<addr>v\d+|v\[\d+:\d+\]), "
                                r"s\[(?P<base>\d+):(?P<high>\d+)\] dmask:0x(?P<mask>[0-9a-f]+) "
