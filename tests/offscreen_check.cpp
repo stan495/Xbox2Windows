@@ -522,7 +522,7 @@ OperationResult run_compute_texture_msaa_case(const OperationContext& ctx)
 OperationResult run_compute_texture_store_case(const OperationContext& ctx)
 {
     return skip_if_false(check_compute_texture_store_file(ctx.device, ctx.argv[3], ctx.argv[4]),
-                         "Typed UAV store unavailable for the image case format");
+                         "Required typed UAV operations unavailable for the image case format");
 }
 
 OperationResult run_spirv_sampler_views(const OperationContext& ctx)

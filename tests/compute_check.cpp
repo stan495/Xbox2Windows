@@ -22,9 +22,12 @@ static_assert(constants_offset % alignment == 0);
 constexpr UINT sentinel = 0xc5c5c5c5u;
 constexpr std::array<UINT, 16> constants{count, 73, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19, 23, 29};
 constexpr UINT uavs = 13, srvs = 21;
-// Bit 24 of an image case's dispatch word selects RGBA8 instead of RGBA32.
-// The case file carries the raw texels for either format.
+// The image case header packs the dispatch count and a format selector. The payload
+// carries raw texels, one word each for RGBA8 and scalar R32, or four for RGBA32.
 constexpr UINT texture_rgba8_flag = 1u << 24;
+constexpr UINT texture_atomic_uint_flag = 1u << 25;
+constexpr UINT texture_atomic_sint_flag = 1u << 26;
+constexpr UINT texture_format_mask = texture_rgba8_flag | texture_atomic_uint_flag | texture_atomic_sint_flag;
 constexpr UINT texture_width = 32, texture_height = 8, texture_channels = 4;
 constexpr UINT texture_mip_levels = 3;
 }
@@ -54,7 +57,7 @@ static ComPtr<ID3D12Resource> upload_texture(ID3D12Device* device, ID3D12Graphic
                                              const std::vector<UINT>& texels,
                                              DXGI_FORMAT format, ComPtr<ID3D12Resource>& staging, bool writable = false)
 {
-    const UINT words_per_texel = format == DXGI_FORMAT_R8G8B8A8_UINT ? 1 : texture_channels;
+    const UINT words_per_texel = format == DXGI_FORMAT_R32G32B32A32_UINT ? texture_channels : 1;
     const UINT base_words = texture_width * texture_height * words_per_texel;
     const UINT mips = texels.size() == base_words ? 1 : texture_mip_levels;
     D3D12_RESOURCE_DESC desc{};
@@ -410,22 +413,46 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     std::ifstream source(reference, std::ios::binary);
     source.read(reinterpret_cast<char*>(&groups), sizeof(groups));
     source.read(reinterpret_cast<char*>(&mip), sizeof(mip));
-    const bool rgba8 = (groups & texture_rgba8_flag) != 0;
-    groups &= ~texture_rgba8_flag;
-    const auto format = rgba8 ? DXGI_FORMAT_R8G8B8A8_UINT : DXGI_FORMAT_R32G32B32A32_UINT;
-    const UINT words_per_texel = rgba8 ? 1 : texture_channels;
+    const UINT selector = groups & texture_format_mask;
+    groups &= ~texture_format_mask;
+    DXGI_FORMAT format = DXGI_FORMAT_R32G32B32A32_UINT;
+    UINT required = D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+    switch (selector) {
+    case 0: break;
+    case texture_rgba8_flag: format = DXGI_FORMAT_R8G8B8A8_UINT; break;
+    case texture_atomic_uint_flag:
+        format = DXGI_FORMAT_R32_UINT;
+        required = D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD |
+                   D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS |
+                   D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE |
+                   D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_EXCHANGE |
+                   D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX;
+        break;
+    case texture_atomic_sint_flag:
+        format = DXGI_FORMAT_R32_SINT;
+        required = D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX;
+        break;
+    default: throw std::runtime_error("Invalid compute image store format selector");
+    }
+    const UINT words_per_texel = selector ? 1 : texture_channels;
     const UINT base_words = texture_width * texture_height * words_per_texel;
     const UINT all_words = base_words + base_words / 4 + base_words / 16;
     std::vector<UINT> initial(all_words), expected(all_words);
     source.read(reinterpret_cast<char*>(initial.data()), all_words * sizeof(UINT));
     source.read(reinterpret_cast<char*>(expected.data()), all_words * sizeof(UINT));
-    if (!source || source.peek() != std::char_traits<char>::eof() || !groups || groups > 2 || mip >= texture_mip_levels)
+    if (!source || source.peek() != std::char_traits<char>::eof() || !groups || groups > 2 || mip >= texture_mip_levels
+        || ((selector == texture_atomic_uint_flag || selector == texture_atomic_sint_flag) && mip != 0))
         throw std::runtime_error("Invalid compute image store reference");
 
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
     check(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)),
           "Check texture UAV format");
-    if (!(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)) return false;
+    if ((support.Support2 & required) != required) {
+        std::printf("format=%u required_support2=0x%x support1=0x%x support2=0x%x\n",
+                    static_cast<UINT>(format), required, static_cast<UINT>(support.Support1),
+                    static_cast<UINT>(support.Support2));
+        return false;
+    }
 
     const auto code = read_texture_shader(path);
     ComPtr<ID3D12RootSignature> signature;
