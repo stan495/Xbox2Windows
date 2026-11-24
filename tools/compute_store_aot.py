@@ -100,8 +100,9 @@ MUBUF_ATOMIC_METHODS = {
     "inc": "CompareExchange", "dec": "CompareExchange",
 }
 
-IMAGE_ATOMIC_OPS = "add|sub|and|or|xor|smin|smax|umin|umax|swap|cmpswap|inc|dec"
-IMAGE_ATOMIC_TYPES = {"R32_UINT": "uint", "R32_SINT": "int"}
+IMAGE_FLOAT_ATOMIC_OPS = ("fcmpswap", "fmin", "fmax")
+IMAGE_ATOMIC_OPS = "add|sub|and|or|xor|smin|smax|umin|umax|swap|cmpswap|inc|dec|" + "|".join(IMAGE_FLOAT_ATOMIC_OPS)
+IMAGE_ATOMIC_TYPES = {"R32_UINT": "uint", "R32_SINT": "int", "R32_FLOAT": "uint"}
 
 
 def checked_group(group):
@@ -202,8 +203,8 @@ MUBUF_SOURCE_TEXELS = {MUBUF_SOURCE_FORMAT: MUBUF_TEXEL_BYTES, MUBUF_D16_SOURCE_
 def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=None, stride=None,
           constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
           source_stride=None, source_format=None, output_format=None, image_descriptor=None, image_format=None,
-          image_uav_mip=None, cpu="gfx1013", lds_bytes=0, lds_f32_mode=None, lds_f64_mode=None,
-          mubuf_d16_xyz_mode=None):
+          image_uav_mip=None, image_float_domain=None, cpu="gfx1013", lds_bytes=0,
+          lds_f32_mode=None, lds_f64_mode=None, mubuf_d16_xyz_mode=None):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     gfx10 compute waves receive each local ID in its own VGPR. Y and Z are bound only when that
@@ -217,7 +218,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     for writes, where image_uav_mip selects the writable subresource and replaces descriptor_offset.
     R32_UINT selects the 4-sample Texture2DMS profile for an SRV or the
     non-returning 2D integer atomic profile for a UAV. R32_SINT is UAV-only
-    and selects signed min/max.
+    and selects signed min/max. R32_FLOAT declares a native atomic image carried as raw words
+    in a desktop R32_UINT UAV. The caller guarantees finite-normal binary32 in the accessed texels
+    and operand VGPRs by setting image_float_domain="finite-normal".
     """
     dims = checked_group(group)
     if cpu not in ("gfx1013", "gfx1030"):
@@ -226,6 +229,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     if not 0 <= table_reg <= 105:
         raise ValueError("Invalid table or thread group binding")
     image_output = image_uav_mip is not None
+    image_float = image_format == "R32_FLOAT"
+    if (image_float and (not image_output or image_float_domain != "finite-normal")
+            or (not image_float and image_float_domain is not None)):
+        raise ValueError("The finite-normal image domain requires an R32_FLOAT atomic UAV and vice versa")
     image_msaa = not image_output and image_format == "R32_UINT"
     if image_msaa and cpu != "gfx1030":
         raise ValueError("The R32_UINT MSAA image binding requires gfx1030")
@@ -1239,9 +1246,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                r"dmask:0x(?P<mask>[0-9a-f]+) dim:SQ_RSRC_IMG_2D(?: unorm)?", line):
             op = m["op"]
             signed = op in ("smin", "smax")
-            if image_atomic_type != ("int" if signed else "uint") or guard_span is not None or stores:
+            if (image_atomic_type != ("int" if signed else "uint") or image_float != (op in IMAGE_FLOAT_ATOMIC_OPS)
+                    or guard_span is not None or stores):
                 raise ValueError("Unsupported image atomic target or binding")
-            compare_swap = op == "cmpswap"
+            compare_swap = op in ("cmpswap", "fcmpswap")
             data = int(m["single"] or m["first"])
             if (int(m["mask"], 16) != (3 if compare_swap else 1) or data + int(compare_swap) > 255
                     or (compare_swap and (m["last"] is None or int(m["last"]) != data + 1))
@@ -1270,8 +1278,21 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                f"        uint next = ({condition}) ? {wrap} : expected {step} 1u;",
                                f"        InterlockedCompareExchange({destination}, expected, next, observed);",
                                "    } while (observed != expected);"))
+            elif op in ("fmin", "fmax"):
+                comparison = "<" if op == "fmin" else ">"
+                # The sign-dependent key orders finite-normal binary32 as unsigned integers.
+                # The zero seed is outside the caller's domain and can only fetch the old word.
+                stores.extend((f"    uint value = {value};",
+                               "    uint valueKey = value ^ ((value & 0x80000000u) ? 0xffffffffu : 0x80000000u);",
+                               "    uint observed = 0u;", "    uint expected;",
+                               "    [allow_uav_condition] do {", "        expected = observed;",
+                               "        uint oldKey = expected ^ ((expected & 0x80000000u) ? 0xffffffffu : 0x80000000u);",
+                               f"        uint next = (valueKey {comparison} oldKey) ? value : expected;",
+                               f"        InterlockedCompareExchange({destination}, expected, next, observed);",
+                               "    } while (observed != expected);"))
             elif compare_swap:
-                # RDNA stores VDATA on a match against VDATA+1; HLSL takes the comparison first.
+                # RDNA stores VDATA on a match against VDATA+1. HLSL takes the comparison first.
+                # Numeric equality and bit equality agree for finite-normal binary32.
                 stores.append(f"    InterlockedCompareStore({destination}, {hlsl_word(sources[1])}, {value});")
             else:
                 if op == "swap":
@@ -1616,7 +1637,9 @@ def main():
                         help="Bind the image to u0 at this mip instead of binding a raw output descriptor")
     parser.add_argument("--image-format", choices=sorted(IMAGE_FORMATS.keys() | IMAGE_ATOMIC_TYPES.keys()),
                         help="Caller-declared image format (R32_UINT for MSAA SRVs or atomic UAVs, "
-                             "R32_SINT for signed min/max UAVs)")
+                             "R32_SINT for signed min/max UAVs, R32_FLOAT for finite-normal atomics)")
+    parser.add_argument("--image-float-domain", choices=("finite-normal",),
+                        help="Required for R32_FLOAT atomics. All accessed texels and operands are finite normals.")
     args = parser.parse_args()
     if (args.descriptor_offset is None) == (args.image_uav_mip is None):
         parser.error("Choose either --descriptor-offset or --image-uav-mip")
@@ -1635,7 +1658,8 @@ def main():
                    source_stride=args.source_stride, source_format=args.source_format,
                    output_format=args.output_format,
                    image_descriptor=args.image_descriptor, image_format=args.image_format,
-                   image_uav_mip=args.image_uav_mip, cpu=args.cpu, lds_bytes=args.lds_bytes,
+                   image_uav_mip=args.image_uav_mip, image_float_domain=args.image_float_domain,
+                   cpu=args.cpu, lds_bytes=args.lds_bytes,
                    lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode,
                    mubuf_d16_xyz_mode=args.mubuf_d16_xyz_mode)
     args.output.parent.mkdir(parents=True, exist_ok=True)

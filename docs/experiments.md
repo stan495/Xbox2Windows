@@ -3504,7 +3504,8 @@ first at mip 0, word 33. The exchange fixture covers matched and unmatched
 compares at both group counts. Reversing the HLSL comparison and replacement
 arguments in the two-group control must fail first at
 `mip=0 word=32 expected=a5a51f3f actual=fffffff0`. Only a complete suite
-records coverage. Returning atomics and float atomics are outside this profile.
+records coverage. Returning atomics are outside this profile. The finite-normal
+float profile is described below.
 
 The LLVM 15 test assembles, disassembles and translates the cases through the
 synthetic-container CLI. The standalone compile modes check the generated
@@ -3561,6 +3562,56 @@ $env:TEMP = $env:TMP
 python -B tests/compute_store_check.py compile-mimg-atomic-counter $Dxc
 cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_mimg_atomic_counter_(warp|hardware)$' -V
+```
+
+### gfx1030 2D float image atomics
+
+`image_atomic_fcmpswap`, `image_atomic_fmin` and `image_atomic_fmax` use a
+linear 2D native `R32_FLOAT` image at mip 0 with `glc` clear. Pass
+`--image-format R32_FLOAT --image-float-domain finite-normal --image-uav-mip 0`
+to declare the profile and bind a desktop `R32_UINT` UAV containing raw
+binary32 words. The caller supplies in-bounds coordinates and guarantees that
+all accessed texels and data VGPRs hold finite normal values. Zeros,
+subnormals, infinities and NaNs are outside
+the profile. Returning forms and other dimensions and mips remain unsupported.
+
+The [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+defines floating compare-swap with replacement in `VDATA` and compare in
+`VDATA+1` (`dmask:0x3`). Binary32 numeric equality reduces to bit equality
+on this domain, so `cs_6_0` uses integer `InterlockedCompareStore`. Min and max
+take one word (`dmask:0x1`) and replace the old word on a strict comparison.
+They compare unsigned keys formed by inverting every bit of negative words
+and toggling the sign bit of positive words. A compare-exchange loop writes
+the selected original bits. Its zero seed obtains the first texel value
+through the atomic result without a typed UAV load. The fixture requires the
+same typed `UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE` support bit on
+`R32_UINT` as the bounded counters.
+
+Five source-built cases compare all 336 words across three mips at one and
+two dispatched groups. They cover
+matching and neighboring nonmatching compare operands, both signs, finite
+normal endpoints, exact ties, and two lanes with distinct operands sharing a
+texel. Swapping the compare-swap operands, reversing either ordering
+predicate, or dropping either retry must fail first at mip 0, word 32.
+LLVM checks assembly, disassembly and synthetic-container translation. The
+DXC check compiles the five shaders and five mutations and checks for integer
+compare-exchange and no typed UAV load in the original DXIL. The GPU tests
+record the three forms after the positive cases and mutation controls pass.
+The compile and container checks run offline. The readback command runs the
+translated DXIL on WARP or desktop hardware. Native execution and native
+special-value behavior remain unmeasured.
+
+```powershell
+$Dxc = (Get-Command dxc -ErrorAction Stop).Source
+$env:TMP = (Resolve-Path out).Path
+$env:TEMP = $env:TMP
+python -B tests/compute_store_check.py compile-mimg-atomic-float $Dxc
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_mimg_atomic_float_(warp|hardware)$' -V
+```
+
+```bash
+python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
 ### Bounded gfx1030 DS lane routing
