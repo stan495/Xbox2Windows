@@ -4068,6 +4068,33 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_csub_' -V
 ```
 
+### gfx1030 fixed-address MUBUF floating atomics
+
+The compute store profile lowers `buffer_atomic_fcmpswap`,
+`buffer_atomic_fmin`, `buffer_atomic_fmax`, and their `_x2` forms with
+`glc` clear. `--atomic-float-finite` declares that the raw UAV target
+starts with a finite normal binary32 or binary64 value and is only
+updated by the shader. The data VGPRs must hold finite normal constants.
+Both widths use the existing sole-UAV-access and address constraints.
+NaN, infinity, subnormal and zero operands require a wider profile.
+
+For finite normal values, comparison equality is bit equality. Min and
+max map the candidate and old bit patterns to unsigned keys ordered by
+numerical value. The update uses an integer compare-exchange retry loop
+and preserves the selected bit pattern. Compile `_x2` with `cs_6_6`.
+
+One and two wave32 groups update a target initialized to a distinct
+negative finite value. An independent CPU floating-point comparison
+provides the expected result. The fixture compares all 320 words and
+checks that reversing min/max or changing the comparison causes the
+first mismatch at the target. LLVM 15 exercises the encodings and
+compute-container CLI. GPU fixtures execute the translated DXIL.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_float' -V
+```
+
 ### Indexed gfx1030 raw vector reads
 
 The compute store profile also lowers `buffer_load_dwordx2`,

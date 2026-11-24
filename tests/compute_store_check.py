@@ -2568,7 +2568,13 @@ def gfx1030_binary(directory, assembler, objcopy, library, cases, prefix, group=
         assert aot.lower(decoded, dims, **binding) == expected
         container, output = directory / f"{name}.dxbc", directory / f"{name}-cli.hlsl"
         container.write_bytes(store_container(code, dims))
-        options = [item for key, value in binding.items() for item in ("--" + key.replace("_", "-"), str(value))]
+        options = []
+        for key, value in binding.items():
+            flag = "--" + key.replace("_", "-")
+            if value is True:
+                options.append(flag)
+            elif value is not False:
+                options.extend((flag, str(value)))
         subprocess.run([sys.executable, "-B", aot.__file__, container, "--output", output,
                         "--llvm", library, *options], check=True)
         assert output.read_text() == expected
@@ -3332,6 +3338,85 @@ def mubuf_counter_draw(directory, compiler, renderer, backend, wide=False, csub=
     return 0
 
 
+def mubuf_float_atomic_cases(wide=False):
+    width = 2 if wide else 1
+    precision = "d" if wide else "f"
+    words_format = "<" + "I" * width
+    for op, replacement in (("fmin", -1e50 if wide else -1e6), ("fmax", 1.5), ("fcmpswap", 2.25)):
+        name = f"buffer_atomic_{op}{'_x2' if wide else ''}"
+        bits = struct.unpack(words_format, struct.pack("<" + precision, replacement))
+        payload = (*bits, *((SENTINEL,) * width if op == "fcmpswap" else ()))
+        data = f"v[10:{9 + len(payload)}]" if len(payload) > 1 else "v10"
+        lines = ["s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
+                 "s_load_dwordx4 s[20:23], s[12:13], 0x30", "s_waitcnt lgkmcnt(0)"]
+        lines += [f"v_mov_b32_e32 v{10 + i}, {value:#x}" for i, value in enumerate(payload)]
+        lines += [f"{name} {data}, off, s[20:23], 0 offset:8", "s_endpgm"]
+        binding = {k: v for k, v in DS_BINDING.items() if k != "stride"}
+        yield name, lines, binding | {"atomic_float_finite": True}, bits
+
+
+def mubuf_float_atomic_controls(wide):
+    _, lines, binding, _ = next(mubuf_float_atomic_cases(wide))
+    rejects("Floating atomic requires a finite normal UAV value declaration", aot.lower, lines, 32,
+            **(binding | {"atomic_float_finite": False}))
+    sign_exp = ("v11", "0x7ff00000") if wide else ("v10", "0x7f800000")
+    reg, inf = sign_exp
+    old = next(line for line in lines if line.startswith(f"v_mov_b32_e32 {reg},"))
+    for bad in ("0", "1", inf, hex(int(inf, 16) | 0x80000)):
+        rejects("Floating atomic operand is not a finite normal constant", aot.lower,
+                variant(lines, (old, old.split(",")[0] + f", {bad}")), 32, **binding)
+
+
+def mubuf_float_atomic_draw(directory, compiler, renderer, backend, wide=False):
+    mubuf_float_atomic_controls(wide)
+    src, cso, case = (directory / f"mubuf-float.{ext}" for ext in ("hlsl", "cso", "case"))
+    compile_shader = [compiler, "-T", "cs_6_6" if wide else "cs_6_0", "-E", "main", "-Fo", cso, src]
+    runner = "--compute-store-case-atomic64" if wide else "--compute-store-case"
+    run = [renderer, backend, runner, cso, case]
+    width = 2 if wide else 1
+    words_format, float_format = "<" + "I" * width, "<d" if wide else "<f"
+    initial = (SENTINEL,) * width
+    original = struct.unpack(float_format, struct.pack(words_format, *initial))[0]
+    accepted = []
+    for name, lines, binding, bits in mubuf_float_atomic_cases(wide):
+        print(name, flush=True)
+        operand = struct.unpack(float_format, struct.pack(words_format, *bits))[0]
+        is_min, is_max = "_fmin" in name, "_fmax" in name
+        # Compare numerically in the reference, independently of the integer-key path.
+        output = bits if ((is_min and operand < original) or (is_max and operand > original)
+                          or not (is_min or is_max)) else initial
+        assert output != initial
+        words = [SENTINEL] * 320
+        words[2:2 + width] = output
+        src.write_text(aot.lower(lines, 32, **binding), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        for groups in (1, 2):
+            case.write_bytes(struct.pack("<321I", groups, *words))
+            result = subprocess.run(run)
+            if result.returncode:
+                return result.returncode
+        if is_min or is_max:
+            changed = variant(lines, ("_fmin" if is_min else "_fmax", "_fmax" if is_min else "_fmin"))
+        else:
+            # Change the comparison to a distinct finite normal float, so the update must fail.
+            last_compare = lines[-3]
+            mismatch = last_compare.replace(f"{SENTINEL:#x}", "0x3ff00000" if wide else "0x3f800000")
+            changed = variant(lines, (last_compare, mismatch))
+        src.write_text(aot.lower(changed, 32, **binding), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        result = subprocess.run(run, capture_output=True, text=True)
+        first = next(i for i in range(width) if output[i] != initial[i])
+        if result.returncode != 1 or f"word={2 + first} expected={output[first]:08x} actual={initial[first]:08x}" not in result.stderr:
+            raise AssertionError(f"{name}: wrong floating operation escaped detection\n{result.stderr}")
+        print(result.stderr, end="")
+        accepted.append(name)
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(accepted) + "\n", encoding="utf-8")
+    return 0
+
+
 def scalar_alu_binary(directory, assembler, objcopy, library):
     """The assembled scalar chain decodes to the same program as its text."""
     src, obj, raw = [directory / x for x in ("scalar.s", "scalar.o", "scalar.bin")]
@@ -3390,6 +3475,10 @@ def binary(directory, assembler, objcopy, library):
         mubuf_exchange_controls(wide)
         gfx1030_binary(directory, assembler, objcopy, library, mubuf_exchange_cases(wide), "buffer_atomic_")
         gfx1030_binary(directory, assembler, objcopy, library, mubuf_counter_cases(wide), "buffer_atomic_")
+        mubuf_float_atomic_controls(wide)
+        gfx1030_binary(directory, assembler, objcopy, library,
+                       ((name, lines, binding) for name, lines, binding, _ in mubuf_float_atomic_cases(wide)),
+                       "buffer_atomic_")
     mubuf_csub_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_csub_cases(), "buffer_atomic_")
     mubuf_subword_controls()
@@ -5801,6 +5890,8 @@ if __name__ == "__main__":
                  "draw-mubuf-subword": mubuf_subword_draw,
                  "draw-mubuf-reduction": mubuf_reduction_draw,
                  "draw-mubuf-csub": lambda d, *a: mubuf_counter_draw(d, *a, csub=True),
+                 "draw-mubuf-float": mubuf_float_atomic_draw,
+                 "draw-mubuf-float-x2": lambda d, *a: mubuf_float_atomic_draw(d, *a, wide=True),
                  "draw-mubuf-counter": mubuf_counter_draw,
                  "draw-mubuf-counter-x2": lambda d, *a: mubuf_counter_draw(d, *a, wide=True),
                  "draw-mubuf-exchange": mubuf_exchange_draw,

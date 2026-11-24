@@ -98,6 +98,7 @@ MUBUF_ATOMIC_METHODS = {
     "smin": "Min", "umin": "Min", "smax": "Max", "umax": "Max",
     "swap": "Exchange", "cmpswap": "CompareExchange",
     "inc": "CompareExchange", "dec": "CompareExchange", "csub": "CompareExchange",
+    "fmin": "CompareExchange", "fmax": "CompareExchange", "fcmpswap": "CompareExchange",
 }
 
 IMAGE_ATOMIC_OPS = "add|sub|and|or|xor|smin|smax|umin|umax|swap|cmpswap"
@@ -203,7 +204,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
           constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
           source_stride=None, source_format=None, output_format=None, image_descriptor=None, image_format=None,
           image_uav_mip=None, cpu="gfx1013", lds_bytes=0, lds_f32_mode=None, lds_f64_mode=None,
-          mubuf_d16_xyz_mode=None):
+          mubuf_d16_xyz_mode=None, atomic_float_finite=False):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     gfx10 compute waves receive each local ID in its own VGPR. Y and Z are bound only when that
@@ -1375,12 +1376,22 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 raise ValueError("Unverified atomic reduction address")
             src, *last = map(int, re.findall(r"\d+", m[3]))
             width = 2 if wide else 1
-            count = 2 * width if op == "cmpswap" else width
+            compare = op in ("cmpswap", "fcmpswap")
+            count = 2 * width if compare else width
             if last != ([src + count - 1] if count > 1 else []) or src + count > 256:
                 raise ValueError("Unverified atomic reduction data range")
             values = [vector.get(reg) for reg in range(src, src + count)]
             if not all(is_word(value) for value in values):
                 raise ValueError("Atomic reduction data is not a known word")
+            if op.startswith("f"):
+                if not atomic_float_finite:
+                    raise ValueError("Floating atomic requires a finite normal UAV value declaration")
+                # Only constant finite normal inputs and a caller-declared finite normal target.
+                shift, exponent_mask = (20, 0x7ff) if wide else (23, 0xff)
+                if not all(isinstance(value, int) for value in values) or any(
+                        ((high_word >> shift) & exponent_mask) in (0, exponent_mask)
+                        for high_word in values[width - 1::width]):
+                    raise ValueError("Floating atomic operand is not a finite normal constant")
             words = list(map(hlsl_word, values))
             operands = ([f"(uint64_t({lo}) | (uint64_t({hi}) << 32u))" for lo, hi in zip(words[::2], words[1::2])]
                         if wide else words)
@@ -1393,15 +1404,24 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             # Both overloads discard the old value. Raw UAV atomics on pairs require SM 6.6.
             kind = ("int64_t" if signed else "uint64_t") if wide else ("int" if signed else "uint")
             method = MUBUF_ATOMIC_METHODS[op] + ("64" if wide else "")
-            if op == "cmpswap":
+            if compare:
+                # Equality of finite normal values is equivalent to bit equality.
                 # The ISA places replacement before compare, unlike the HLSL argument order.
                 word = f"{operands[1]}, {word}"
-            if op in ("inc", "dec", "csub"):
+            if op in ("inc", "dec", "csub", "fmin", "fmax"):
+                keys = ()
                 one, zero = ("1ull", "0ull") if wide else ("1u", "0u")
                 if op == "inc":
                     desired = f"expected >= limit ? {zero} : expected + {one}"
                 elif op == "dec":
                     desired = f"expected == {zero} || expected > limit ? limit : expected - {one}"
+                elif op in ("fmin", "fmax"):
+                    sign_bit = "0x8000000000000000ull" if wide else "0x80000000u"
+                    # These unsigned keys sort finite normal IEEE words by numerical value.
+                    keys = tuple(f"        {kind} {name}Key = ({name} & {sign_bit}) ? ~{name} : ({name} ^ {sign_bit});"
+                                 for name in ("limit", "expected"))
+                    compare_op = "<" if op == "fmin" else ">"
+                    desired = f"limitKey {compare_op} expectedKey ? limit : expected"
                 else:
                     desired = "expected < limit ? 0u : expected - limit"
                     # GLC overwrites the data VGPR. Track its wait and reject consumers of the
@@ -1411,7 +1431,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 # Seed the first compare with zero. A failed CAS returns the word for the next try.
                 stores.extend((f"    const {kind} limit = {word};", f"    {kind} observed = {zero};",
                                f"    {kind} expected;", "    [allow_uav_condition] do {",
-                               "        expected = observed;", f"        {kind} next = {desired};",
+                               "        expected = observed;", *keys, f"        {kind} next = {desired};",
                                f"        outputData.Interlocked{method}({offset}u, expected, next, observed);",
                                "    } while (observed != expected);"))
             else:
@@ -1618,6 +1638,8 @@ def main():
     parser.add_argument("--image-format", choices=sorted(IMAGE_FORMATS.keys() | IMAGE_ATOMIC_TYPES.keys()),
                         help="Caller-declared image format (R32_UINT for MSAA SRVs or atomic UAVs, "
                              "R32_SINT for signed min/max UAVs)")
+    parser.add_argument("--atomic-float-finite", action="store_true",
+                        help="Declare a finite normal initial value at a floating atomic UAV address")
     args = parser.parse_args()
     if (args.descriptor_offset is None) == (args.image_uav_mip is None):
         parser.error("Choose either --descriptor-offset or --image-uav-mip")
@@ -1638,7 +1660,7 @@ def main():
                    image_descriptor=args.image_descriptor, image_format=args.image_format,
                    image_uav_mip=args.image_uav_mip, cpu=args.cpu, lds_bytes=args.lds_bytes,
                    lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode,
-                   mubuf_d16_xyz_mode=args.mubuf_d16_xyz_mode)
+                   mubuf_d16_xyz_mode=args.mubuf_d16_xyz_mode, atomic_float_finite=args.atomic_float_finite)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
     print(json.dumps({"container_sha256": hashlib.sha256(blob).hexdigest(),
