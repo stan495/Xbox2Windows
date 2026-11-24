@@ -32,7 +32,7 @@ jobs:
       - name: Check machine-code inputs with LLVM 15
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends llvm-15 spirv-tools spirv-cross
+          sudo apt-get install -y --no-install-recommends llvm-15 spirv-tools spirv-cross glslang-tools
           python3 -B - <<'PY'
           import concurrent.futures
           import os
@@ -63,6 +63,8 @@ jobs:
               (["tests/pixel_compare_sample_check.py", *COMMON_LLVM], {}),
               (["tests/pixel_compare_lod_check.py", *COMMON_LLVM], {}),
               (["tests/pixel_compare_clamp_check.py", *COMMON_LLVM], {}),
+              (["tests/pixel_compare_grad_check.py", *COMMON_LLVM, "llc-15"], {}),
+              (["tests/pixel_compare_grad_check.py", "glsl", "glslangValidator", "spirv-val", "spirv-dis"], {}),
               (["tests/pixel_compare_check.py", *COMMON_LLVM], {}),
               (["tests/compute_mimg_msaa_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1"], {}),
               (["tests/compute_mimg_float_store_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "--llvm", "libLLVM-15.so.1"], {}),

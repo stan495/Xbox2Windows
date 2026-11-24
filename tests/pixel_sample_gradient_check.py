@@ -103,7 +103,7 @@ def check_lowering():
         ("SQ_RSRC_IMG_2D", "SQ_RSRC_IMG_2D d16", "Unsupported instruction"),
         ("image_sample_d ", "image_sample_cd ", "requires gfx1030"),
         ("image_sample_d ", "image_sample_d_cl ", "Unsupported instruction"),
-        ("image_sample_d ", "image_sample_c_d ", "Unsupported instruction"),
+        ("image_sample_d ", "image_sample_c_d_cl ", "Unsupported instruction"),
     ):
         reject([line.replace(old, new) for line in lines], diagnostic)
     undefined = [line for line in lines if not line.startswith("v_mov_b32_e32 v5,")]
