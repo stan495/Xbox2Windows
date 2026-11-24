@@ -2854,6 +2854,8 @@ def scalar_alu_binary(directory, assembler, objcopy, library):
 def binary(directory, assembler, objcopy, library):
     mubuf_subword_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_subword_cases(), "buffer_load_")
+    mubuf_vector_controls()
+    gfx1030_binary(directory, assembler, objcopy, library, mubuf_vector_cases(), "buffer_load_")
     mtbuf_store_binary(directory, assembler, objcopy, library)
     scalar_alu_binary(directory, assembler, objcopy, library)
     ds_controls()
@@ -3142,6 +3144,80 @@ def mubuf_subword_draw(directory, compiler, renderer, backend):
         path = Path(record)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("".join(f"buffer_load_{name}\n" for name in MUBUF_SUBWORD), encoding="utf-8")
+    return 0
+
+
+def mubuf_vector_cases():
+    for count in (2, 3, 4):
+        name = f"buffer_load_dwordx{count}"
+        data = f"v[7:{6 + count}]"
+        # v8 is both the input index and a destination; v15 holds the separate output index.
+        yield name, [
+            "s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
+            "s_load_dwordx4 s[20:23], s[12:13], 0x30",
+            "s_load_dwordx4 s[16:19], s[12:13], 0x40",
+            "v_lshl_add_u32 v8, s11, 5, v0", "v_lshl_add_u32 v15, s11, 5, v0",
+            "s_waitcnt lgkmcnt(0)", f"{name} {data}, v8, s[16:19], 0 idxen offset:4",
+            "s_waitcnt vmcnt(0)", f"buffer_store_dwordx{count} {data}, v15, s[20:23], 0 idxen", "s_endpgm",
+        ], DS_BINDING | {"stride": 4 * (count + 1), "source_descriptor": 0x40, "source_stride": 4 * (count + 1)}
+
+
+def mubuf_vector_controls():
+    for name, lines, binding in mubuf_vector_cases():
+        count = int(name[-1])
+        load = lines[7]
+        data = f"v[7:{6 + count}]"
+        for old, new, diagnostic in (
+            (data, "v7", "Unverified buffer read destination"),
+            (data, f"v[255:{254 + count}]", "Unverified buffer read destination"),
+            (data, f"v[7:{7 + count}]", "Unverified buffer read destination"),
+            ("idxen", "offen", "Unsupported vector buffer read target or address mode"),
+            ("offset:4", "offset:2", "Unverified read offset"),
+            ("offset:4", "offset:8", "Read leaves its source element"),
+            ("offset:4", "offset:4 tfe", "Unsupported compute instruction"),
+            ("s[16:19]", "s[20:23]", "Reads from the stored UAV"),
+        ):
+            rejects(diagnostic, aot.lower, variant(lines, (load, load.replace(old, new))), 32, **binding)
+        for use in ("", f"v_mov_b32_e32 v16, v{6 + count}\ns_waitcnt vmcnt(0)",
+                    f"v_mov_b32_e32 v{6 + count}, 0\ns_waitcnt vmcnt(0)"):
+            rejects("before s_waitcnt vmcnt(0)", aot.lower, variant(lines, ("s_waitcnt vmcnt(0)", use)), 32, **binding)
+        rejects("Unverified buffer read descriptor", aot.lower,
+                variant(lines, ("s_waitcnt lgkmcnt(0)", "")), 32, **binding)
+        rejects("Unsupported vector buffer read target", aot.lower, lines, 32, **(binding | {"cpu": "gfx1013"}))
+
+
+def mubuf_vector_draw(directory, compiler, renderer, backend):
+    mubuf_vector_controls()
+    src, cso, case = (directory / f"mubuf-vector.{ext}" for ext in ("hlsl", "cso", "case"))
+    compile = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+    run = [renderer, backend, "--compute-store-case", cso, case]
+    for name, lines, binding in mubuf_vector_cases():
+        count = int(name[-1])
+        print(f"{name}: CPU reference", flush=True)
+        src.write_text(aot.lower(lines, 32, **binding), encoding="ascii")
+        subprocess.run(compile, check=True)
+        for groups in (1, 2):
+            words = [SENTINEL] * 320
+            for gid in range(32 * groups):
+                start = gid * (count + 1)
+                words[start:start + count] = [source_word(start + 1 + i) for i in range(count)]
+            case.write_bytes(struct.pack("<321I", groups, *words))
+            result = subprocess.run(run)
+            if result.returncode:
+                return result.returncode
+        print(f"{name}: swap first and last channels", flush=True)
+        last = 6 + count
+        swap = f"s_waitcnt vmcnt(0)\nv_mov_b32_e32 v16, v7\nv_mov_b32_e32 v7, v{last}\nv_mov_b32_e32 v{last}, v16"
+        src.write_text(aot.lower(variant(lines, ("s_waitcnt vmcnt(0)", swap)), 32, **binding), encoding="ascii")
+        subprocess.run(compile, check=True)
+        bad = subprocess.run(run, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word=0 expected={source_word(1):08x} actual={source_word(count):08x}" not in bad.stderr:
+            raise AssertionError(f"{name}: swapped channels escaped detection\n{bad.stderr}")
+        print(bad.stderr, end="")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(f"{name}\n" for name, _, _ in mubuf_vector_cases()), encoding="utf-8")
     return 0
 
 
@@ -3691,6 +3767,7 @@ if __name__ == "__main__":
         # The store cases and the guard/read cases run as separate CTest entries so each stays within its timeout.
         modes = {"binary": binary, "draw": draw,
                  "draw-mubuf-subword": mubuf_subword_draw,
+                 "draw-mubuf-vector": mubuf_vector_draw,
                  "draw-mtbuf-load": mtbuf_load_draw,
                  "draw-ds-route": ds_draw,
                  "draw-lds-qword": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_QWORD_CASES),

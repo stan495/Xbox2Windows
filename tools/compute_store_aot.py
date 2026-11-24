@@ -980,11 +980,19 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified row pitch byte offset")
             vector[dst] = ("pitch_bytes", row_tag[1], int(pitch, 0), *column_tag[1:])
-        elif m := re.fullmatch(r"(?:buffer_load_(?:dword|(?P<subword>[us](?:byte|short)))|(?P<typed>tbuffer_load_format_x)) "
-                               r"v(?P<dst>\d+), (?P<addr>off|v\d+), s\[(?P<base>\d+):(?P<high>\d+)\], 0"
+        elif m := re.fullmatch(r"(?:buffer_load_(?:dword(?:x(?P<count>[234]))?|(?P<subword>[us](?:byte|short)))"
+                               r"|(?P<typed>tbuffer_load_format_x)) "
+                               r"v(?:\[(?P<first>\d+):(?P<last>\d+)\]|(?P<dst>\d+)), "
+                               r"(?P<addr>off|v\d+), s\[(?P<base>\d+):(?P<high>\d+)\], 0"
                                r"(?(typed) format:\[BUF_FMT_32_UINT\])(?P<idxen> idxen)?(?P<offen> offen)?"
                                r"(?: offset:(?P<offset>\d+))?", line):
-            dst, base, high = int(m["dst"]), int(m["base"]), int(m["high"])
+            count = int(m["count"] or 1)
+            first = int(m["dst"] or m["first"])
+            if (count == 1 and m["dst"] is None or count > 1 and m["last"] is None
+                    or m["last"] is not None and int(m["last"]) != first + count - 1
+                    or first + count > 256):
+                raise ValueError("Unverified buffer read destination")
+            base, high = int(m["base"]), int(m["high"])
             offset = int(m["offset"] or 0)
             addr, idxen, offen = m["addr"], m["idxen"], m["offen"]
             subword = m["subword"]
@@ -993,7 +1001,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Unsupported typed buffer read target or address mode")
             if subword and (cpu != "gfx1030" or not idxen or offen):
                 raise ValueError("Unsupported subword buffer read target or address mode")
-            if (dst > 255 or high != base + 3 or base % 4 or high > 105
+            if count > 1 and (cpu != "gfx1030" or not idxen or offen):
+                raise ValueError("Unsupported vector buffer read target or address mode")
+            if (high != base + 3 or base % 4 or high > 105
                     or pending.intersection(range(base, high + 1))):
                 raise ValueError("Unverified buffer read descriptor")
             kinds = tuple(scalar.get(base + i) for i in range(4))
@@ -1014,12 +1024,20 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             elif (idxen and not offen and source_stride is not None and isinstance(tag, tuple)
                   and tag[0] == "thread"):
                 # idxen: index * stride + instruction offset, inside one source element.
-                if offset + width > source_stride:
+                if offset + width * count > source_stride:
                     raise ValueError("Read leaves its source element")
-                address = f"tid.{AXES[tag[1]]} * {source_stride}u + {offset & ~3}u"
+                address = f"tid.{AXES[tag[1]]} * {source_stride}u"
             else:
                 raise ValueError("Unsupported read address")
-            vector.pop(dst, None)
+            if count > 1:
+                # The index was read above: it may alias any register in this range.
+                for i in range(count):
+                    vector.pop(first + i, None)
+                    loading[first + i] = ("source", f"{address} + {offset + 4 * i}u")
+                continue
+            if idxen:
+                address += f" + {offset & ~3}u"
+            vector.pop(first, None)
             word = ("source", address)
             if subword:
                 # The stride and SRV base are DWORD-aligned, so the enclosing word stays in the record.
@@ -1029,7 +1047,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     sign = f"{1 << (bits - 1):#x}u"
                     field = f"(({field} ^ {sign}) - {sign})"
                 word = ("alu", field)
-            loading[dst] = word
+            loading[first] = word
         elif m := re.fullmatch(r"(?:buffer_store_dword(?:x([234]))?|tbuffer_store_format_(?P<channels>x|xy|xyz|xyzw)) "
                                r"(v\d+|v\[\d+:\d+\]), (off|v\d+|v\[\d+:\d+\]), s\[(\d+):(\d+)\], 0"
                                r"(?(channels) format:\[(?P<format>BUF_FMT_(?:32_){1,4}UINT)\])"
