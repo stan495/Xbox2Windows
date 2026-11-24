@@ -3550,7 +3550,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     """Track descriptor provenance, interpolation and packed or uncompressed exports.
 
     texture_offset is the aligned byte offset of t0 in the texture descriptor table.
-    sample_clamp_mips opts into the experimental minimum-LOD interpretation of ordinary _cl
+    sample_clamp_mips opts into the experimental minimum-LOD interpretation of _cl
     samples, with the declared number of visible mips in matching gfx1030 and desktop views.
     gather_mips declares the number of visible mips in matching gfx1030 and desktop 2D views.
     For comparison gather the selected red texel values and the reference must be in [0, 1].
@@ -5244,10 +5244,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for dst, value in zip(dests, values):
                 vector[dst] = value
                 sample_dest[dst] = vector_loads
-        elif m := match(r"(image_sample_c(?:(?:_lz|_l|_b)?(?:_o)?|_c?d(?:_o)?(?:_g16)?)) "
+        elif m := match(r"(image_sample_c(?:(?:_lz|_l|_b|_cl|_b_cl)?(?:_o)?|_c?d(?:_o)?(?:_g16)?)) "
                         r"(v\d+), (?:v\[(\d+):(\d+)\]|\[(v\d+), (v\d+), (v\d+)\]), "
                         r"s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x1 dim:SQ_RSRC_IMG_2D"):
-            # RDNA 2 orders the address as offset, bias, reference, gradients, UV, explicit LOD.
+            # RDNA 2 orders the address as offset, bias, reference, gradients, UV, explicit LOD or clamp.
             # Only the reference and UV pair are present in every comparison form.
             op, dst, first, last, *nsa = m.groups()[:7]
             image = registers(*m.groups()[7:9], 8)
@@ -5255,7 +5255,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             g16 = op.endswith("_g16")
             stem = op.removesuffix("_g16")
             has_offset = stem.endswith("_o")
-            base_op = stem.removesuffix("_o")
+            stem = stem.removesuffix("_o")
+            has_clamp = stem.endswith("_cl")
+            base_op = stem.removesuffix("_cl")
+            if has_clamp and sample_clamp_mips != 2:
+                raise ValueError("Comparison clamp requires --sample-clamp-mips 2")
             coarse = base_op == "image_sample_c_cd"
             if coarse and cpu != "gfx1030":
                 raise ValueError("Coarse comparison gradients require gfx1030")
@@ -5265,7 +5269,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             has_level_operand = base_op in ("image_sample_c_l", "image_sample_c_b")
             if first is None and op != "image_sample_c_lz":
                 raise ValueError("Comparison sample requires a contiguous address")
-            width = 3 + has_offset + has_level_operand + gradient_words
+            width = 3 + has_offset + has_level_operand + gradient_words + has_clamp
             address = ([f"v{n}" for n in registers(first, last, width)]
                        if first is not None else nsa)
             if any(int(reg[1:]) > 255 for reg in (dst, *address)):
@@ -5279,7 +5283,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or descriptor != [("tex", j) for j in range(8)]
                     or [scalar.get(f"s{n}") for n in state] != list(sampler)):
                 raise ValueError("Unsupported image or sampler binding")
-            if has_level_operand or gradient_words:
+            if has_level_operand or gradient_words or has_clamp:
                 label = "Comparison gradient sampling" if gradient_words else "Comparison LOD/bias"
                 if sampler[1] & 0xfff000 != 0x100000 or (sampler[2] >> 26) & 3 != 1:
                     raise ValueError(f"{label} requires MAX_LOD 1 and point mip filtering")
@@ -5288,13 +5292,29 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             elif implicit_derivatives and sampler[1] & 0xfff000:
                 raise ValueError("Implicit comparison sampling requires MAX_LOD 0")
             offset_arg = sample_offset_arg(address.pop(0), vector, sample_dest, known_ssa_bits) if has_offset else ""
+            clamp_arg = ""
+            if has_clamp:
+                clamp = address.pop()
+                if clamp in sample_dest:
+                    raise ValueError("Comparison clamp used before vmcnt wait")
+                value = vector.get(clamp)
+                bits = known_ssa_bits.get(value) if isinstance(value, str) else None
+                if bits not in (0, 0x3f800000):
+                    raise ValueError("Comparison minimum LOD must be statically 0 or 1")
+                offset_arg = offset_arg or ", int2(0, 0)"
+                clamp_arg = ", 0.0f" if bits == 0 else ", 1.0f"
+                sample_clamp_used = True
             extra_args = ""
             if has_level_operand:
                 operand = address.pop() if explicit_lod else address.pop(0)
                 if operand in sample_dest:
                     raise ValueError("Comparison LOD operand used before vmcnt wait")
                 value = vector.get(operand)
-                if not isinstance(value, str) or known_ssa_bits.get(value) not in (0, 0x3f800000):
+                bits = known_ssa_bits.get(value) if isinstance(value, str) else None
+                if has_clamp:
+                    if bits not in (0xbf800000, 0, 0x3f800000):
+                        raise ValueError("Clamped comparison bias must be statically -1, 0 or 1")
+                elif bits not in (0, 0x3f800000):
                     raise ValueError("Comparison LOD or bias must be statically 0 or 1")
                 extra_args = f", {value}"
             if gradient_words:
@@ -5342,7 +5362,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                       "image_sample_c_b": "SampleCmpBias", "image_sample_c_d": "SampleCmpGrad",
                       "image_sample_c_cd": "SampleCmpGrad", "image_sample_c": "SampleCmp"}[base_op]
             lines.append(f"    float sample{i} = tex.{method}(samp, float2({u}, {v}), "
-                         f"{reference}{extra_args}{offset_arg});")
+                         f"{reference}{extra_args}{offset_arg}{clamp_arg});")
             samples += 1
             sampled_textures.add("tex")
             vector_loads += 1

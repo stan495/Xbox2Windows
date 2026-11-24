@@ -9182,6 +9182,36 @@ python -B tests/pixel_compare_grad_check.py compile-coarse dxc
 ctest --preset dev --no-tests=error -j 1 -R '^pixel_aot_compare_coarse_grad_(warp|hardware)$' -V
 ```
 
+### Experimental gfx1030 2D comparison sample minimum LOD
+
+`--cpu gfx1030 --sample-clamp-mips 2` selects an experimental two-mip
+comparison profile for `image_sample_c_cl`, `image_sample_c_cl_o`,
+`image_sample_c_b_cl` and `image_sample_c_b_cl_o`. The translator takes
+sequential 2D addresses in offset, bias, reference, UV and clamp order, with
+optional offset and bias. The known clamp is `0` or `1`. The optional bias
+is a known `-1`, `0` or `1`. The matched comparison sampler uses point XY
+and mip filtering, zero sampler bias, and LOD limits of zero and one.
+The clamp maps to the final `SampleCmp` or `SampleCmpBias` operand.
+
+The desktop fixture uses a two-mip depth texture with spatially distinct
+levels. It checks every channel at 8×8 and 16×16, uses direct HLSL with an
+explicit mip as a control and tests mutations that select a different mip.
+The plain draw reuses the comparison mip fixture and its advanced texture
+operations capability gate. The Bias draw requires PS 6.8 and
+`SampleCmpGradientAndBiasSupported`.
+
+```sh
+python3 -B tests/pixel_compare_clamp_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+```powershell
+ctest --preset dev --no-tests=error -j 1 -R '^pixel_aot_compare_clamp_' -V
+```
+
+Native gfx1030 readback is needed to settle the clamp direction and the
+order relative to bias. The fixture omits the form coverage record while
+the native behavior is unmeasured.
+
 ### Desktop xmem.dll
 
 `src/xmem_shim.cpp` builds `xmem.dll`, which exports the four functions the package DLLs import by name. The call shapes come from the observed call sites, not from a published header:
