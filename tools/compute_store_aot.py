@@ -97,7 +97,7 @@ MUBUF_ATOMIC_METHODS = {
     "add": "Add", "sub": "Add", "and": "And", "or": "Or", "xor": "Xor",
     "smin": "Min", "umin": "Min", "smax": "Max", "umax": "Max",
     "swap": "Exchange", "cmpswap": "CompareExchange",
-    "inc": "CompareExchange", "dec": "CompareExchange",
+    "inc": "CompareExchange", "dec": "CompareExchange", "csub": "CompareExchange",
 }
 
 
@@ -1273,12 +1273,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 vector.pop(reg, None)
                 loading[reg] = ("alu", f"{name}.{component}")
         elif m := re.fullmatch(rf"buffer_atomic_({'|'.join(MUBUF_ATOMIC_METHODS)})(_x2)? "
-                               r"(v\d+|v\[\d+:\d+\]), off, s\[(\d+):(\d+)\], 0(?: offset:(\d+))?", line):
+                               r"(v\d+|v\[\d+:\d+\]), off, s\[(\d+):(\d+)\], 0(?: offset:(\d+))?( glc)?", line):
             if cpu != "gfx1030" or stride is not None or output_format is not None or image_output:
                 raise ValueError("Unsupported atomic reduction target or binding")
             if stores:
                 raise ValueError("An atomic reduction must be the only UAV operation")
             op, wide = m[1], bool(m[2])
+            if op == "csub" and (wide or not m[7]):
+                raise ValueError("Conditional subtract requires 32-bit glc")
+            if op != "csub" and m[7]:
+                raise ValueError(f"Unsupported compute instruction: {line}")
             base, high = int(m[4]), int(m[5])
             offset = int(m[6] or 0)
             if (high != base + 3 or base % 4 or pending.intersection(range(base, high + 1))
@@ -1309,12 +1313,18 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if op == "cmpswap":
                 # The ISA places replacement before compare, unlike the HLSL argument order.
                 word = f"{operands[1]}, {word}"
-            if op in ("inc", "dec"):
+            if op in ("inc", "dec", "csub"):
                 one, zero = ("1ull", "0ull") if wide else ("1u", "0u")
                 if op == "inc":
                     desired = f"expected >= limit ? {zero} : expected + {one}"
-                else:
+                elif op == "dec":
                     desired = f"expected == {zero} || expected > limit ? limit : expected - {one}"
+                else:
+                    desired = "expected < limit ? 0u : expected - limit"
+                    # GLC overwrites the data VGPR. Track its wait and reject consumers of the
+                    # old value until the profile can emit a value-producing atomic.
+                    vector.pop(src, None)
+                    loading[src] = None
                 # Seed the first compare with zero. A failed CAS returns the word for the next try.
                 stores.extend((f"    const {kind} limit = {word};", f"    {kind} observed = {zero};",
                                f"    {kind} expected;", "    [allow_uav_condition] do {",

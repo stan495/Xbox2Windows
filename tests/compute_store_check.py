@@ -3266,13 +3266,36 @@ def mubuf_counter_cases(wide=False):
         yield name, lines, {k: v for k, v in DS_BINDING.items() if k != "stride"}
 
 
-def mubuf_counter_draw(directory, compiler, renderer, backend, wide=False):
+MUBUF_CSUB_STEP = 0x04000000
+
+
+def mubuf_csub_cases():
+    _, lines, binding = next(mubuf_counter_cases())
+    lines = variant(lines, ("v_mov_b32_e32 v10, 8", f"v_mov_b32_e32 v10, {MUBUF_CSUB_STEP:#x}"),
+                    (lines[-2], lines[-2].replace("buffer_atomic_inc", "buffer_atomic_csub") + " glc"))
+    yield "buffer_atomic_csub", lines, binding
+
+
+def mubuf_csub_controls():
+    _, lines, binding = next(mubuf_csub_cases())
+    operation = lines[-2]
+    rejects("Conditional subtract requires 32-bit glc", aot.lower,
+            variant(lines, (operation, operation.removesuffix(" glc"))), 32, **binding)
+    for wait, diagnostic in (("", "before s_waitcnt vmcnt(0)"), ("s_waitcnt vmcnt(0)\n", "Unverified ALU operand")):
+        use = operation + "\n" + wait + "v_xor_b32_e32 v11, 0, v10"
+        rejects(diagnostic, aot.lower, variant(lines, (operation, use)), 32, **binding)
+
+
+def mubuf_counter_draw(directory, compiler, renderer, backend, wide=False, csub=False):
     src, cso, case = (directory / f"mubuf-counter.{ext}" for ext in ("hlsl", "cso", "case"))
     compile_shader = [compiler, "-T", "cs_6_6" if wide else "cs_6_0", "-E", "main", "-Fo", cso, src]
     runner = "--compute-store-case-atomic64" if wide else "--compute-store-case"
     run = [renderer, backend, runner, cso, case]
     accepted = []
-    for name, lines, binding in mubuf_counter_cases(wide):
+    if csub:
+        mubuf_csub_controls()
+    cases = mubuf_csub_cases() if csub else mubuf_counter_cases(wide)
+    for name, lines, binding in cases:
         print(name, flush=True)
         kernel = aot.lower(lines, 32, **binding)
         src.write_text(kernel, encoding="ascii")
@@ -3283,6 +3306,8 @@ def mubuf_counter_draw(directory, compiler, renderer, backend, wide=False):
             limit = (1 << 32) + 8 if wide else 8
             remaining = (32 * groups - 1) % (limit + 1)
             value = remaining if "_inc" in name else limit - remaining
+            if csub:
+                value = max(0, SENTINEL - 32 * groups * MUBUF_CSUB_STEP)
             words[2] = value & 0xffffffff
             if wide:
                 words[3] = value >> 32
@@ -3290,13 +3315,14 @@ def mubuf_counter_draw(directory, compiler, renderer, backend, wide=False):
             result = subprocess.run(run)
             if result.returncode:
                 return result.returncode
-        mutant = kernel.replace("while (observed != expected)", "while (false)")
+        mutant = (kernel.replace("expected < limit ? 0u : expected - limit", "expected - limit") if csub
+                  else kernel.replace("while (observed != expected)", "while (false)"))
         assert mutant != kernel
         src.write_text(mutant, encoding="ascii")
         subprocess.run(compile_shader, check=True)
         bad = subprocess.run(run, capture_output=True, text=True)
         if bad.returncode != 1 or f"word=2 expected={words[2]:08x} actual={SENTINEL:08x}" not in bad.stderr:
-            raise AssertionError(f"{name}: missing CAS retry escaped detection\n{bad.stderr}")
+            raise AssertionError(f"{name}: incorrect update escaped detection\n{bad.stderr}")
         print(bad.stderr, end="")
         accepted.append(name)
     if record := os.environ.get("FORM_COVERAGE_RECORD"):
@@ -3364,6 +3390,8 @@ def binary(directory, assembler, objcopy, library):
         mubuf_exchange_controls(wide)
         gfx1030_binary(directory, assembler, objcopy, library, mubuf_exchange_cases(wide), "buffer_atomic_")
         gfx1030_binary(directory, assembler, objcopy, library, mubuf_counter_cases(wide), "buffer_atomic_")
+    mubuf_csub_controls()
+    gfx1030_binary(directory, assembler, objcopy, library, mubuf_csub_cases(), "buffer_atomic_")
     mubuf_subword_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_subword_cases(), "buffer_load_")
     mubuf_vector_controls()
@@ -5512,6 +5540,7 @@ if __name__ == "__main__":
         modes = {"binary": binary, "draw": draw,
                  "draw-mubuf-subword": mubuf_subword_draw,
                  "draw-mubuf-reduction": mubuf_reduction_draw,
+                 "draw-mubuf-csub": lambda d, *a: mubuf_counter_draw(d, *a, csub=True),
                  "draw-mubuf-counter": mubuf_counter_draw,
                  "draw-mubuf-counter-x2": lambda d, *a: mubuf_counter_draw(d, *a, wide=True),
                  "draw-mubuf-exchange": mubuf_exchange_draw,

@@ -3743,6 +3743,27 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_counter' -V
 ```
 
+### gfx1030 fixed-address MUBUF conditional subtract
+
+The compute store profile lowers `buffer_atomic_csub` under the same
+fixed-address and sole-UAV-access constraints as the counters. The
+32-bit operation subtracts the unsigned operand and clamps at zero.
+LLVM 15 requires `glc` for this opcode. The translator marks the replaced
+VGPR pending until `vmcnt(0)` and accepts instruction streams that discard
+the returned word. An attempted use of the returned value is rejected.
+The update uses the counters' compare-exchange retry loop.
+
+With one group of 32 lanes the counter remains positive. A second group
+exhausts the counter and leaves zero. The readback compares all 320 words
+with the CPU reference. The wrapping-subtract mutation fails at word 2.
+LLVM 15 checks assembly and the compute-container CLI. GPU tests execute
+the translated DXIL.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_csub_' -V
+```
+
 ### Indexed gfx1030 raw vector reads
 
 The compute store profile also lowers `buffer_load_dwordx2`,
