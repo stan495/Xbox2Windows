@@ -4802,20 +4802,26 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             vector_loads += 1
             vector[dst] = f"alu{i}"
             sample_dest[dst] = vector_loads
-        elif m := match(r"(image_sample_c(?:_lz|_l|_b)?(?:_o)?) (v\d+), (?:v\[(\d+):(\d+)\]|\[(v\d+), (v\d+), (v\d+)\]), "
+        elif m := match(r"(image_sample_c(?:(?:_lz|_l|_b)?(?:_o)?|_d(?:_o)?(?:_g16)?)) "
+                        r"(v\d+), (?:v\[(\d+):(\d+)\]|\[(v\d+), (v\d+), (v\d+)\]), "
                         r"s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x1 dim:SQ_RSRC_IMG_2D"):
-            # RDNA 2 orders the address as offset, bias, reference, UV, explicit LOD.
+            # RDNA 2 orders the address as offset, bias, reference, gradients, UV, explicit LOD.
             # Only the reference and UV pair are present in every comparison form.
             op, dst, first, last, *nsa = m.groups()[:7]
             image = registers(*m.groups()[7:9], 8)
             state = registers(*m.groups()[9:11], 4)
-            has_offset = op.endswith("_o")
-            base_op = op.removesuffix("_o")
-            explicit_level = base_op in ("image_sample_c_lz", "image_sample_c_l")
+            g16 = op.endswith("_g16")
+            stem = op.removesuffix("_g16")
+            has_offset = stem.endswith("_o")
+            base_op = stem.removesuffix("_o")
+            gradient_words = (2 if g16 else 4) if base_op == "image_sample_c_d" else 0
+            explicit_lod = base_op in ("image_sample_c_lz", "image_sample_c_l")
+            implicit_derivatives = not (explicit_lod or gradient_words)
             has_level_operand = base_op in ("image_sample_c_l", "image_sample_c_b")
             if first is None and op != "image_sample_c_lz":
                 raise ValueError("Comparison sample requires a contiguous address")
-            address = ([f"v{n}" for n in registers(first, last, 3 + has_offset + has_level_operand)]
+            width = 3 + has_offset + has_level_operand + gradient_words
+            address = ([f"v{n}" for n in registers(first, last, width)]
                        if first is not None else nsa)
             if any(int(reg[1:]) > 255 for reg in (dst, *address)):
                 raise ValueError("Comparison sample VGPR out of range")
@@ -4828,24 +4834,48 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or descriptor != [("tex", j) for j in range(8)]
                     or [scalar.get(f"s{n}") for n in state] != list(sampler)):
                 raise ValueError("Unsupported image or sampler binding")
-            if has_level_operand:
+            if has_level_operand or gradient_words:
+                label = "Comparison gradient sampling" if gradient_words else "Comparison LOD/bias"
                 if sampler[1] & 0xfff000 != 0x100000 or (sampler[2] >> 26) & 3 != 1:
-                    raise ValueError("Comparison LOD/bias requires MAX_LOD 1 and point mip filtering")
+                    raise ValueError(f"{label} requires MAX_LOD 1 and point mip filtering")
                 if (sampler[2] >> 20) & 0xf:
-                    raise ValueError("Comparison LOD/bias requires point XY filtering")
-            elif not explicit_level and sampler[1] & 0xfff000:
+                    raise ValueError(f"{label} requires point XY filtering")
+            elif implicit_derivatives and sampler[1] & 0xfff000:
                 raise ValueError("Implicit comparison sampling requires MAX_LOD 0")
             offset_arg = sample_offset_arg(address.pop(0), vector, sample_dest, known_ssa_bits) if has_offset else ""
-            level_arg = ""
+            extra_args = ""
             if has_level_operand:
-                operand = address.pop() if explicit_level else address.pop(0)
+                operand = address.pop() if explicit_lod else address.pop(0)
                 if operand in sample_dest:
                     raise ValueError("Comparison LOD operand used before vmcnt wait")
                 value = vector.get(operand)
                 if not isinstance(value, str) or known_ssa_bits.get(value) not in (0, 0x3f800000):
                     raise ValueError("Comparison LOD or bias must be statically 0 or 1")
-                level_arg = f", {value}"
-            if not explicit_level and any(vector.get(reg) not in quad_values for reg in address[1:]):
+                extra_args = f", {value}"
+            if gradient_words:
+                derivatives = address[1:1 + gradient_words]
+                del address[1:1 + gradient_words]
+                slope_components = []
+                for reg in derivatives:
+                    if reg in sample_dest:
+                        raise ValueError("Comparison gradient used before vmcnt wait")
+                    value = vector.get(reg)
+                    bits = known_ssa_bits.get(value) if isinstance(value, str) else None
+                    if bits is None:
+                        raise ValueError("Comparison gradient must be statically known")
+                    # Require normal values or zero in the input precision.
+                    magnitudes = ((bits & 0x7fff, (bits >> 16) & 0x7fff) if g16 else (bits & 0x7fffffff,))
+                    lower, upper = (0x0400, 0x7c00) if g16 else (0x00800000, 0x7f800000)
+                    if any(component and not lower <= component < upper for component in magnitudes):
+                        raise ValueError("Comparison gradient components must be normal or zero")
+                    if g16:
+                        word = f"asuint({value})"
+                        slope_components.extend((f"widen16({word})", f"widen16({word} >> 16)"))
+                    else:
+                        slope_components.append(value)
+                dudx, dvdx, dudy, dvdy = slope_components
+                extra_args = f", float2({dudx}, {dvdx}), float2({dudy}, {dvdy})"
+            if implicit_derivatives and any(vector.get(reg) not in quad_values for reg in address[1:]):
                 raise ValueError("Implicit comparison sampling requires coordinates with quad provenance")
             if not xy_coordinates([vector.get(reg) for reg in address[1:]], quad_values):
                 if attribute_scales:
@@ -4863,9 +4893,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     raise ValueError("Unsupported comparison sample operand")
             reference, u, v = values
             method = {"image_sample_c_lz": "SampleCmpLevelZero", "image_sample_c_l": "SampleCmpLevel",
-                      "image_sample_c_b": "SampleCmpBias", "image_sample_c": "SampleCmp"}[base_op]
+                      "image_sample_c_b": "SampleCmpBias", "image_sample_c_d": "SampleCmpGrad",
+                      "image_sample_c": "SampleCmp"}[base_op]
             lines.append(f"    float sample{i} = tex.{method}(samp, float2({u}, {v}), "
-                         f"{reference}{level_arg}{offset_arg});")
+                         f"{reference}{extra_args}{offset_arg});")
             samples += 1
             sampled_textures.add("tex")
             vector_loads += 1

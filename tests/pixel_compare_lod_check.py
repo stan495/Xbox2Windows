@@ -101,8 +101,6 @@ def binary(directory, assembler, objcopy, library):
 
 
 def reference_rows(size, scale, mip, displacement):
-    # Mip zero covers exactly one texel per pixel at both viewport sizes.
-    # For the bias forms this makes the implicit LOD zero before applying the bias.
     width = 8 >> mip
     rows = []
     for y in range(size):
@@ -134,8 +132,7 @@ def write_case(path, size, rows):
     path.write_bytes(data)
 
 
-def check_shader(directory, mode, compiler, renderer=None, adapter=None):
-    target = "ps_6_8" if mode == "bias" else "ps_6_7"
+def probe_shader_profile(directory, compiler, target):
     probe = directory / "probe.hlsl"
     probe.write_text("float4 main() : SV_Target { return 0; }\n", encoding="ascii")
     args = [compiler, "-T", target, "-E", "main"]
@@ -147,19 +144,27 @@ def check_shader(directory, mode, compiler, renderer=None, adapter=None):
             raise SystemExit(77)
         raise AssertionError(diagnostic)
 
-    def run_draw(case, expected_mismatch=None):
-        run = subprocess.run([renderer, adapter, f"--check-pixel-compare-{mode}", shader, case],
-                             capture_output=True, text=True)
-        print(run.stdout, end="")
-        if run.returncode == 77:
-            print(run.stderr, end="", file=sys.stderr)
-            raise SystemExit(77)
-        if expected_mismatch is None:
-            assert run.returncode == 0, (run.stdout, run.stderr)
-        else:
-            observed = next((line for line in run.stderr.splitlines() if line.startswith("pixel_mismatch ")), None)
-            assert run.returncode == 1 and observed == expected_mismatch, (
-                expected_mismatch, run.stdout, run.stderr)
+    return args
+
+
+def run_draw(renderer, adapter, mode, shader, case, expected_mismatch=None):
+    run = subprocess.run([renderer, adapter, f"--check-pixel-compare-{mode}", shader, case],
+                         capture_output=True, text=True)
+    print(run.stdout, end="")
+    if run.returncode == 77:
+        print(run.stderr, end="", file=sys.stderr)
+        raise SystemExit(77)
+    if expected_mismatch is None:
+        assert run.returncode == 0, (run.stdout, run.stderr)
+    else:
+        observed = next((line for line in run.stderr.splitlines() if line.startswith("pixel_mismatch ")), None)
+        assert run.returncode == 1 and observed == expected_mismatch, (
+            expected_mismatch, run.stdout, run.stderr)
+
+
+def check_shader(directory, mode, compiler, renderer=None, adapter=None):
+    target = "ps_6_8" if mode == "bias" else "ps_6_7"
+    args = probe_shader_profile(directory, compiler, target)
 
     source = directory / "sample.hlsl"
     shader, case = source.with_suffix(".cso"), source.with_suffix(".case")
@@ -167,6 +172,7 @@ def check_shader(directory, mode, compiler, renderer=None, adapter=None):
     for op in FORMS[mode]:
         displacement = OFFSET if op.endswith("_o") else (0, 0)
         for size in (8, 16):
+            # Mip-zero footprint is one texel per pixel, so implicit LOD is zero.
             scale = size // 8
             baseline = reference_rows(size, scale, 1, displacement)
             write_case(case, size, baseline)
@@ -179,14 +185,14 @@ def check_shader(directory, mode, compiler, renderer=None, adapter=None):
                 subprocess.run([*args, "-Fo", shader, source], check=True)
                 if variant == "original":
                     if renderer:
-                        run_draw(case)
+                        run_draw(renderer, adapter, mode, shader, case)
                     continue
                 mutated = reference_rows(size, scale, mip, offset)
                 mismatch = first_mismatch(size, baseline, mutated)
                 if renderer:
                     write_case(mutated_case, size, mutated)
-                    run_draw(mutated_case)
-                    run_draw(case, mismatch)
+                    run_draw(renderer, adapter, mode, shader, mutated_case)
+                    run_draw(renderer, adapter, mode, shader, case, mismatch)
                 print(f"{op} {size} {variant} {'readback' if renderer else 'CPU prediction'} {mismatch}")
     if renderer:
         write_record(os.environ.get("FORM_COVERAGE_RECORD"))

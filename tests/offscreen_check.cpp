@@ -769,21 +769,21 @@ OperationResult run_sampled_coverage(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
-OperationResult run_check_pixel_compare_lod(const OperationContext& ctx)
+OperationResult run_check_pixel_compare_mips(const OperationContext& ctx)
 {
 // Windows SDK 10.0.22621 does not declare the SM 6.8 capability query.
 #if defined(__ID3D12Device14_INTERFACE_DEFINED__)
-    const bool bias = std::strcmp(ctx.argv[2], "--check-pixel-compare-bias") == 0;
-    const D3D_SHADER_MODEL required = bias ? D3D_SHADER_MODEL_6_8 : D3D_SHADER_MODEL_6_7;
+    const bool level = std::strcmp(ctx.argv[2], "--check-pixel-compare-level") == 0;
+    const D3D_SHADER_MODEL required = level ? D3D_SHADER_MODEL_6_7 : D3D_SHADER_MODEL_6_8;
     D3D12_FEATURE_DATA_SHADER_MODEL shaderModel{required};
     if (FAILED(check_feature(ctx.device, D3D12_FEATURE_SHADER_MODEL, &shaderModel, sizeof(shaderModel))) ||
         shaderModel.HighestShaderModel < required)
-        return {OutcomeKind::skip, bias ? "Comparison bias requires SM 6.8" : "Comparison LOD requires SM 6.7"};
-    if (bias) {
+        return {OutcomeKind::skip, level ? "Comparison LOD requires SM 6.7" : "Comparison bias/gradient requires SM 6.8"};
+    if (!level) {
         D3D12_FEATURE_DATA_D3D12_OPTIONS21 options{};
         if (FAILED(check_feature(ctx.device, D3D12_FEATURE_D3D12_OPTIONS21, &options, sizeof(options))) ||
             !options.SampleCmpGradientAndBiasSupported)
-            return {OutcomeKind::skip, "Comparison bias requires SampleCmpGradientAndBiasSupported"};
+            return {OutcomeKind::skip, "Comparison bias/gradient requires SampleCmpGradientAndBiasSupported"};
     } else {
         D3D12_FEATURE_DATA_D3D12_OPTIONS14 options{};
         if (FAILED(check_feature(ctx.device, D3D12_FEATURE_D3D12_OPTIONS14, &options, sizeof(options))) ||
@@ -794,7 +794,7 @@ OperationResult run_check_pixel_compare_lod(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 #else
     (void)ctx;
-    return {OutcomeKind::skip, "Comparison LOD/bias fixture requires Windows SDK 10.0.26100 headers"};
+    return {OutcomeKind::skip, "Comparison mip fixture requires Windows SDK 10.0.26100 headers"};
 #endif
 }
 
@@ -1612,8 +1612,9 @@ const OperationSpec kOperations[] = {
     {"--dual-pixel-swapped", 5, 5, nullptr, kNoGate, run_dual_pixel_swapped},
     {"--sampled-coverage", 5, 5, nullptr, kNoGate, run_sampled_coverage},
     {"--check-pixel-compare", 5, 5, nullptr, kNoGate, run_check_pixel_compare},
-    {"--check-pixel-compare-level", 5, 5, nullptr, kNoGate, run_check_pixel_compare_lod},
-    {"--check-pixel-compare-bias", 5, 5, nullptr, kNoGate, run_check_pixel_compare_lod},
+    {"--check-pixel-compare-level", 5, 5, nullptr, kNoGate, run_check_pixel_compare_mips},
+    {"--check-pixel-compare-bias", 5, 5, nullptr, kNoGate, run_check_pixel_compare_mips},
+    {"--check-pixel-compare-grad", 5, 5, nullptr, kNoGate, run_check_pixel_compare_mips},
     {"--check-pixel-gather", 5, 5, nullptr, kNoGate, run_check_pixel_gather},
     {"--check-pixel-compare-gather", 6, 7, nullptr, kNoGate, run_check_pixel_compare_gather},
     {"--check-pixel-case", 5, 6, nullptr, kNoGate, run_check_pixel_case},

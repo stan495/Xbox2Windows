@@ -8051,6 +8051,51 @@ unsupported profile, SDK header set or device capability as a skip (77).
 Intel Arc B390 and WARP passed the Level tests. WARP passed the Bias tests.
 Arc B390 reported the Bias capability unavailable and skipped those tests.
 
+### gfx1030 2D comparison sample gradients
+
+`image_sample_c_d`, `image_sample_c_d_o`, `image_sample_c_d_g16`, and
+`image_sample_c_d_o_g16` lower to `SampleCmpGrad` for a 2D `R32_FLOAT` view
+with two visible mips and `dmask:0x1`. The contiguous address starts with the
+optional packed signed XY offset, then the comparison reference, the explicit
+gradients in `(du/dx, dv/dx, du/dy, dv/dy)` order, and the full-width UV pair.
+G16 packs each gradient vector as two binary16 components with U in the low
+half and V in the high half. The gradient inputs must be statically known
+normal values or zero in their input precision. The explicit gradients do not
+require whole-quad UV provenance. The comparison sampler uses point XY and
+mip filtering, clamp-to-edge addressing, `MIN_LOD = 0`, `MAX_LOD = 1`, and no
+sampler LOD bias. Bind the same range on the desktop comparison sampler.
+
+The depth fixture compares every RGBA pixel at 8×8 and 16×16 against the CPU
+reference. A horizontal V slope of −1/4 at 8×8 and a vertical U slope of +1/4
+at 16×16 each select mip one. Zeroing the active slope selects mip zero. In
+the offset forms, replacing `(1, -2)` with `(0, 0)` changes the taps in mip one.
+Each mutation must match its complete CPU reference and first differ from the
+original at the predicted pixel and values. The fixture measures these whole
+mip choices and leaves fractional LOD transitions unmeasured.
+
+LLVM 15 code generation checks the comparison reference, optional offset and
+gradient order for all four encodings, including the two distinct G16 packed
+words. LLVM MC, the disassembler and the container CLI check the end-to-end
+machine-code path. The GLSL `sampler2DShadow` check validates the explicit
+reference and `Grad` or `Grad|ConstOffset` operands in SPIR-V. The DXC compile
+check verifies four distinct gradient components in the emitted DXIL call.
+
+```sh
+python3 -B tests/pixel_compare_grad_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1 llc-15
+python3 -B tests/pixel_compare_grad_check.py glsl glslangValidator spirv-val spirv-dis
+```
+
+```powershell
+python -B tests/pixel_compare_grad_check.py compile dxc
+ctest --preset dev --no-tests=error -j 1 -R '^pixel_aot_compare_grad_(warp|hardware)$' -V
+```
+
+The draw requires PS 6.8 and `D3D12_OPTIONS21.SampleCmpGradientAndBiasSupported`.
+An unsupported shader profile or missing SDK or device capability produces a
+capability skip (77). WARP passed readback for all four forms. Intel Arc B390
+reported the comparison gradient capability unavailable and skipped the test.
+Physical GPU readback requires an adapter that reports this capability.
+
 ### Desktop xmem.dll
 
 `src/xmem_shim.cpp` builds `xmem.dll`, which exports the four functions the package DLLs import by name. The call shapes come from the observed call sites, not from a published header:
