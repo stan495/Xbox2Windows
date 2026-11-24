@@ -3492,6 +3492,30 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_reduction_' -V
 python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
+### gfx1030 fixed-address MUBUF atomic x2 reductions
+
+The same reduction profile supports the `_x2` forms of all nine integer
+operations. The instruction supplies two consecutive VGPRs, low word
+first, and targets an eight-byte-aligned address. The caller provides an
+aligned, in-range raw UAV and the same linear descriptor as for the 32-bit
+forms. The lowering combines both words into one 64-bit operand and uses
+a single interlocked operation. Addition and subtraction wrap at 64 bits,
+and min/max use the matching signedness. The caller compiles this HLSL
+with `cs_6_6`. The D3D12 fixture returns a capability skip if the adapter
+lacks SM 6.6 or `Int64ShaderOps`.
+
+The CPU reference reduces distinct word pairs and compares all 320
+readback words, including the neighboring words, for one and two groups.
+Changing the operation or signedness must produce a difference in the
+low or high word of the atomic target. The rejection controls cover
+unverified VGPR pairs, four-byte-only alignment and `glc`. LLVM 15
+assembles each `_x2` form and checks the compute-container CLI.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_reduction_x2_' -V
+```
+
 ### Indexed gfx1030 raw vector reads
 
 The compute store profile also lowers `buffer_load_dwordx2`,

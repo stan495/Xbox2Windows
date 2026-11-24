@@ -1142,6 +1142,9 @@ constexpr CapabilityGate kGateAddressWindow{
     D3D_SHADER_MODEL_6_0, true, false, 0,
     "skip: address window fixture requires SM 6.0 and 64-bit shader integer operations",
     CapsDiagnostic::none};
+constexpr CapabilityGate kGateComputeAtomic64{
+    D3D_SHADER_MODEL_6_6, true, false, 0, "skip: 64-bit raw UAV atomics require SM 6.6 and Int64ShaderOps",
+    CapsDiagnostic::none};
 constexpr CapabilityGate kGateSm66Ballot{
     D3D_SHADER_MODEL_6_6, false, false, 0,
     "skip: ballot fixture requires SM 6.6",
@@ -1177,6 +1180,7 @@ const OperationSpec kOperations[] = {
     {"--compute-root-file", 4, 4, nullptr, kNoGate, run_compute_root_file},
     {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
+    {"--compute-store-case-atomic64", 5, 5, nullptr, kGateComputeAtomic64, run_compute_store_case},
     {"--compute-texture-case", 5, 5, nullptr, kNoGate, run_compute_texture_case},
     {"--spirv-sampler-views", 4, 4, nullptr, kGateSm60SamplerViews, run_spirv_sampler_views},
     {"--dynamic-sampler-index", 3, 3, nullptr, kGateSm60SamplerViews, run_dynamic_sampler_index},

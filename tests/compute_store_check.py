@@ -3044,29 +3044,38 @@ def mtbuf_store_draw(directory, compiler, renderer, backend):
 MUBUF_REDUCTION_INPUT = 0x2434c810
 
 
-def mubuf_reduction_cases():
+def mubuf_reduction_cases(wide=False):
     for op in ("add", "sub", "and", "or", "xor", "smin", "umin", "smax", "umax"):
-        name = f"buffer_atomic_{op}"
+        name = f"buffer_atomic_{op}{'_x2' if wide else ''}"
+        data, offset = ("v[10:11]", 8) if wide else ("v10", 4)
         lines = ["s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
                  "s_load_dwordx4 s[20:23], s[12:13], 0x30",
                  "v_lshl_add_u32 v8, s11, 5, v0", "s_waitcnt lgkmcnt(0)",
                  f"v_xor_b32_e32 v10, {MUBUF_REDUCTION_INPUT:#x}, v8",
                  "v_and_b32_e32 v12, 3, v8", "v_lshlrev_b32_e32 v12, 30, v12",
-                 "v_xor_b32_e32 v10, v12, v10", "v_cmp_gt_u32_e32 vcc_lo, 63, v8", "s_and_saveexec_b32 s14, vcc_lo",
-                 f"{name} v10, off, s[20:23], 0 offset:4", "s_endpgm"]
+                 "v_xor_b32_e32 v10, v12, v10"]
+        if wide:
+            lines += ["v_xor_b32_e32 v11, 0x100000, v10"]
+        lines += ["v_cmp_gt_u32_e32 vcc_lo, 63, v8", "s_and_saveexec_b32 s14, vcc_lo",
+                  f"{name} {data}, off, s[20:23], 0 offset:{offset}", "s_endpgm"]
         yield name, lines, {k: v for k, v in DS_BINDING.items() if k != "stride"}
 
 
-def mubuf_reduction_reference(op, groups):
+def mubuf_reduction_reference(op, groups, wide=False):
     inputs = [MUBUF_REDUCTION_INPUT ^ gid ^ ((gid % 4) * 0x40000000) for gid in range(min(32 * groups, 63))]
+    initial, bits = SENTINEL, 32
+    if wide:
+        initial |= SENTINEL << 32
+        bits = 64
+        inputs = [word + (word ^ 0x100000) * (1 << 32) for word in inputs]
     if op in ("add", "sub"):
-        return (SENTINEL + (sum(inputs) if op == "add" else -sum(inputs))) % (1 << 32)
-    values = [SENTINEL, *inputs]
+        return (initial + (sum(inputs) if op == "add" else -sum(inputs))) % (1 << bits)
+    values = [initial, *inputs]
     if op in ("smin", "smax", "umin", "umax"):
         compare = min if op.endswith("min") else max
         signed = op.startswith("s")
-        return compare(values, key=lambda word: word - (1 << 32) if signed and word >= (1 << 31) else word)
-    result = SENTINEL
+        return compare(values, key=lambda word: word - (1 << bits) if signed and word >= (1 << (bits - 1)) else word)
+    result = initial
     for value in inputs:
         if op == "and":
             result &= value
@@ -3100,33 +3109,58 @@ def mubuf_reduction_controls():
     rejects("Unsupported atomic reduction target or binding", aot.lower, lines, 32, **(binding | {"stride": 4}))
 
 
-def mubuf_reduction_draw(directory, compiler, renderer, backend):
-    mubuf_reduction_controls()
+def mubuf_reduction_x2_controls():
+    _, lines, binding = next(mubuf_reduction_cases(wide=True))
+    atomic = lines[-2]
+    for replacement, diagnostic in (
+        (atomic.replace("v[10:11]", "v10"), "Unverified atomic reduction data range"),
+        (atomic.replace("v[10:11]", "v[10:12]"), "Unverified atomic reduction data range"),
+        (atomic.replace("v[10:11]", "v[255:256]"), "Unverified atomic reduction data range"),
+        (atomic.replace("v[10:11]", "v[12:13]"), "Atomic reduction data is not a known word"),
+        (atomic.replace("offset:8", "offset:4"), "Unverified atomic reduction address"),
+        (atomic + " glc", "Unsupported compute instruction"),
+    ):
+        rejects(diagnostic, aot.lower, variant(lines, (atomic, replacement)), 32, **binding)
+
+
+def mubuf_reduction_draw(directory, compiler, renderer, backend, wide=False):
+    (mubuf_reduction_x2_controls if wide else mubuf_reduction_controls)()
     src, cso, case = (directory / f"mubuf-reduction.{ext}" for ext in ("hlsl", "cso", "case"))
-    compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
-    run = [renderer, backend, "--compute-store-case", cso, case]
+    compile_shader = [compiler, "-T", "cs_6_6" if wide else "cs_6_0", "-E", "main", "-Fo", cso, src]
+    runner = "--compute-store-case-atomic64" if wide else "--compute-store-case"
+    run = [renderer, backend, runner, cso, case]
     wrong_ops = {"add": "sub", "sub": "add", "and": "or", "or": "and", "xor": "or",
                  "smin": "umin", "umin": "smin", "smax": "umax", "umax": "smax"}
     accepted = []
-    for name, lines, binding in mubuf_reduction_cases():
-        op = name.removeprefix("buffer_atomic_")
+    for name, lines, binding in mubuf_reduction_cases(wide):
+        op = name.removeprefix("buffer_atomic_").removesuffix("_x2")
         print(name, flush=True)
         src.write_text(aot.lower(lines, 32, **binding), encoding="ascii")
         subprocess.run(compile_shader, check=True)
         for groups in (1, 2):
             words = [SENTINEL] * 320
-            words[1] = mubuf_reduction_reference(op, groups)
+            reference = mubuf_reduction_reference(op, groups, wide)
+            if wide:
+                words[2:4] = struct.unpack("<2I", struct.pack("<Q", reference))
+            else:
+                words[1] = reference
             case.write_bytes(struct.pack("<321I", groups, *words))
             result = subprocess.run(run)
             if result.returncode:
                 return result.returncode
         wrong = wrong_ops[op]
-        changed = variant(lines, (name, f"buffer_atomic_{wrong}"))
+        changed = variant(lines, (name, f"buffer_atomic_{wrong}{'_x2' if wide else ''}"))
         src.write_text(aot.lower(changed, 32, **binding), encoding="ascii")
         subprocess.run(compile_shader, check=True)
         result = subprocess.run(run, capture_output=True, text=True)
-        actual = mubuf_reduction_reference(wrong, groups)
-        if result.returncode != 1 or f"word=1 expected={words[1]:08x} actual={actual:08x}" not in result.stderr:
+        actual = mubuf_reduction_reference(wrong, groups, wide)
+        if wide:
+            actual_low, actual_high = struct.unpack("<2I", struct.pack("<Q", actual))
+            first = 2 if words[2] != actual_low else 3
+            actual = actual_low if first == 2 else actual_high
+        else:
+            first = 1
+        if result.returncode != 1 or f"word={first} expected={words[first]:08x} actual={actual:08x}" not in result.stderr:
             raise AssertionError(f"{name}: incorrect reduction escaped detection\n{result.stderr}")
         print(result.stderr, end="")
         accepted.append(name)
@@ -3160,7 +3194,9 @@ def mimg_load_binary(directory, assembler, objcopy, library):
 
 def binary(directory, assembler, objcopy, library):
     mubuf_reduction_controls()
-    gfx1030_binary(directory, assembler, objcopy, library, mubuf_reduction_cases(), "buffer_atomic_")
+    mubuf_reduction_x2_controls()
+    for wide in (False, True):
+        gfx1030_binary(directory, assembler, objcopy, library, mubuf_reduction_cases(wide), "buffer_atomic_")
     mubuf_subword_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_subword_cases(), "buffer_load_")
     mubuf_vector_controls()
@@ -4904,6 +4940,7 @@ if __name__ == "__main__":
         modes = {"binary": binary, "draw": draw,
                  "draw-mubuf-subword": mubuf_subword_draw,
                  "draw-mubuf-reduction": mubuf_reduction_draw,
+                 "draw-mubuf-reduction-x2": lambda d, *a: mubuf_reduction_draw(d, *a, wide=True),
                  "draw-mubuf-vector": mubuf_vector_draw,
                  "draw-mubuf-d16": mubuf_d16_draw,
                  "draw-mubuf-format": mubuf_format_draw,

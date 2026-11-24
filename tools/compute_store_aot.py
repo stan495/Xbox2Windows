@@ -1217,32 +1217,39 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 reg = first + index
                 vector.pop(reg, None)
                 loading[reg] = ("alu", f"{name}.{component}")
-        elif m := re.fullmatch(rf"buffer_atomic_({'|'.join(MUBUF_ATOMIC_REDUCTIONS)}) "
-                               r"v(\d+), off, s\[(\d+):(\d+)\], 0(?: offset:(\d+))?", line):
+        elif m := re.fullmatch(rf"buffer_atomic_({'|'.join(MUBUF_ATOMIC_REDUCTIONS)})(_x2)? "
+                               r"(v\d+|v\[\d+:\d+\]), off, s\[(\d+):(\d+)\], 0(?: offset:(\d+))?", line):
             if cpu != "gfx1030" or stride is not None or output_format is not None:
                 raise ValueError("Unsupported atomic reduction target or binding")
             if stores:
                 raise ValueError("An atomic reduction must be the only UAV operation")
-            op = m[1]
-            src, base, high = map(int, m.groups()[1:4])
-            offset = int(m[5] or 0)
+            op, wide = m[1], bool(m[2])
+            base, high = int(m[4]), int(m[5])
+            offset = int(m[6] or 0)
             if (high != base + 3 or base % 4 or pending.intersection(range(base, high + 1))
                     or any(scalar.get(base + i) != ("uav", i) for i in range(4))):
                 raise ValueError("Unverified atomic reduction descriptor")
-            if offset > 4095 or offset % 4:
+            if offset > 4095 or offset % (8 if wide else 4):
                 raise ValueError("Unverified atomic reduction address")
-            value = vector.get(src)
-            if src > 255 or not is_word(value):
+            src, *last = map(int, re.findall(r"\d+", m[3]))
+            count = 2 if wide else 1
+            if last != ([src + 1] if wide else []) or src + count > 256:
+                raise ValueError("Unverified atomic reduction data range")
+            values = [vector.get(reg) for reg in range(src, src + count)]
+            if not all(is_word(value) for value in values):
                 raise ValueError("Atomic reduction data is not a known word")
-            word = hlsl_word(value)
+            words = list(map(hlsl_word, values))
+            word = f"(uint64_t({words[0]}) | (uint64_t({words[1]}) << 32u))" if wide else words[0]
             signed = op in ("smin", "smax")
             if signed:
-                word = f"asint({word})"
+                word = f"int64_t({word})" if wide else f"asint({word})"
             elif op == "sub":
-                word = f"(0u - {word})"
-            # The pre-operation value has no consumer. Use the matching signedness of the DXIL overload.
-            stores.extend((f"    {'int' if signed else 'uint'} ignoredAtomic;",
-                           f"    outputData.Interlocked{MUBUF_ATOMIC_REDUCTIONS[op]}({offset}u, {word}, ignoredAtomic);"))
+                word = f"({'0ull' if wide else '0u'} - {word})"
+            # Both overloads discard the old value. Raw UAV atomics on pairs require SM 6.6.
+            kind = ("int64_t" if signed else "uint64_t") if wide else ("int" if signed else "uint")
+            method = MUBUF_ATOMIC_REDUCTIONS[op] + ("64" if wide else "")
+            stores.extend((f"    {kind} ignoredAtomic;",
+                           f"    outputData.Interlocked{method}({offset}u, {word}, ignoredAtomic);"))
             atomic_reduction = True
         elif m := re.fullmatch(r"(?:buffer_store_(?:dword(?:x(?P<raw_count>[234]))?|(?P<subword>byte|short)(?P<store_hi>_d16_hi)?)|"
                                r"(?P<typed>t)?buffer_store_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
