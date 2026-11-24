@@ -78,7 +78,7 @@ def controls(forms):
         if op in COARSE:
             must_reject(lambda: lower(lines, words, cpu="gfx1013"), "require gfx1030")
             clamp = op.replace("_c_cd", "_c_cd_cl")
-            must_reject(lambda: lower([line.replace(op, clamp) for line in lines], words), "Unsupported instruction")
+            must_reject(lambda: lower([line.replace(op, clamp) for line in lines], words), "requires --sample-clamp-mips 2")
         nsa = "[" + ", ".join(f"v{reg}" for reg in range(first, 10)) + "]"
         for old, new, diagnostic in (
             (f"v[{first}:9]", f"v[{first}:8]", "Descriptor or vector width mismatch"),

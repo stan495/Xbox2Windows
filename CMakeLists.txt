@@ -9697,6 +9697,9 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_compare_clamp_check.py" compile "${mode}" "${DXC_EXECUTABLE}")
         set_tests_properties(${test_name} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
+    add_test(NAME pixel_aot_compare_gradient_clamp_compile COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/pixel_compare_gradient_clamp_check.py" compile "${DXC_EXECUTABLE}")
+    set_tests_properties(pixel_aot_compare_gradient_clamp_compile PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     add_test(NAME rdna2_tools_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/rdna2_tools_check.py")
     add_test(NAME rdna2_cli_checks COMMAND "${INTAKE_PYTHON}" -B
@@ -10863,6 +10866,11 @@ if(EXISTS "${INTAKE_PYTHON}")
                 "$<TARGET_FILE:offscreen_check>" "${adapter}")
             set_tests_properties(${test_name} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         endforeach()
+        add_test(NAME pixel_aot_compare_gradient_clamp_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_compare_gradient_clamp_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" "${adapter}")
+        set_tests_properties(pixel_aot_compare_gradient_clamp_${adapter} PROPERTIES
+            TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         add_test(NAME pixel_aot_compare_sample_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_compare_sample_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" "${adapter}")

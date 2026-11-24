@@ -9212,6 +9212,30 @@ Native gfx1030 readback is needed to settle the clamp direction and the
 order relative to bias. The fixture omits the form coverage record while
 the native behavior is unmeasured.
 
+### Experimental gfx1030 2D comparison gradient minimum LOD
+
+The two-mip comparison clamp profile also accepts `image_sample_c_d_cl`,
+`image_sample_c_d_cl_o`, `image_sample_c_cd_cl`, `image_sample_c_cd_cl_o`
+and their `_g16` counterparts. The trailing clamp word follows the full-width
+UV pair. The profile retains the comparison gradient rules for statically
+known normal or zero slope words. It passes the known clamp, zero or one,
+to `SampleCmpGrad` with the optional immediate offset.
+
+The source-built fixture checks a gradient below the clamp and one that
+selects the higher mip against a CPU depth reference at 8×8 and 16×16.
+The draw requires PS 6.8 and `SampleCmpGradientAndBiasSupported`.
+
+```sh
+python3 -B tests/pixel_compare_gradient_clamp_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+```powershell
+ctest --preset dev --no-tests=error -j 1 -R '^pixel_aot_compare_gradient_clamp_' -V
+```
+
+Native gfx1030 readback remains required for the clamp direction and coarse
+gradient behavior. The experiment omits a form coverage record.
+
 ### Desktop xmem.dll
 
 `src/xmem_shim.cpp` builds `xmem.dll`, which exports the four functions the package DLLs import by name. The call shapes come from the observed call sites, not from a published header:
