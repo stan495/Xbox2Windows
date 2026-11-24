@@ -1,6 +1,7 @@
 """Verify the bounded gfx1030 2D per-instruction minimum LOD profile."""
 import math
 from pathlib import Path
+import difflib
 import re
 import struct
 import subprocess
@@ -9,6 +10,7 @@ import tempfile
 
 from compute_store_check import assemble
 from pixel_aot_check import envelope, pixel_aot
+from pixel_sample_gradient_check import COARSE_FORMS, FORMS as EXPLICIT_FORMS, program as gradient_program
 from pixel_sample_lod_check import base_prefix, compile_ps, export_tail
 from pixel_sample_offset_check import draw
 
@@ -22,7 +24,12 @@ FORMS = {
     "image_sample_b_cl": (0x26, 7),
     "image_sample_b_cl_o": (0x36, 6),
 }
+GRADIENT_FORMS = {
+    op.replace('_cd', '_cd_cl', 1) if '_cd' in op else op.replace('_d', '_d_cl', 1): (op, first)
+    for op, (first, _) in (EXPLICIT_FORMS | COARSE_FORMS).items()
+}
 SIDE, MIPS = 8, 3
+
 
 
 def program(op, *, floor="1.0", bias="0.0", offset="0x3f01", scale=1, runtime=False, sampler=SAMPLER):
@@ -39,6 +46,17 @@ def program(op, *, floor="1.0", bias="0.0", offset="0x3f01", scale=1, runtime=Fa
     for index, value in enumerate(sampler, 40):
         prefix[prefix.index(f"s_mov_b32 s{index}, {index - 39}")] = f"s_mov_b32 s{index}, 0x{value:x}"
     return prefix + body + export_tail()
+
+
+def clamped_gradient(op, slopes, *, floor="1.0", offset="0x3f01"):
+    base, first = GRADIENT_FORMS[op]
+    lines = gradient_program(base, slopes, offset=offset, entry_uv=True)
+    for register, word in enumerate(SAMPLER, 40):
+        lines[lines.index(f"s_mov_b32 s{register}, {register - 39}")] = f"s_mov_b32 s{register}, {word:#x}"
+    index = next(i for i, line in enumerate(lines) if line.startswith(base + " "))
+    sample = lines[index].replace(base, op).replace(f"v[{first}:9]", f"v[{first}:10]")
+    lines[index:index + 1] = [f"v_mov_b32_e32 v10, {floor}", sample]
+    return lines
 
 
 def translate(lines, *, sampler=SAMPLER, **kwargs):
@@ -153,14 +171,29 @@ def check_reference():
                 print(f"CPU {op}/{kind} (0,0) expected={correct[0]} actual={wrong[0]}")
 
 
-def check_intrinsic_order(directory, llc):
+def check_intrinsic_order(directory, llc, *, gradient=False):
     # Use distinct non-inline literals to observe their assigned VGPRs. Mesa's
     # AMD LLVM backend maps NIR min_lod to the final float on these intrinsics.
-    for op in FORMS:
-        has_offset, has_bias = op.endswith("_o"), "_b_" in op
-        mods = op.removeprefix("image_sample").replace("_", ".")
-        intrinsic = f"llvm.amdgcn.image.sample{mods}.2d.v4f32.f32" + (".f32" if has_bias else "")
+    forms = GRADIENT_FORMS if gradient else FORMS
+    for op in forms:
+        g16 = op.endswith("_g16")
+        has_offset = op.removesuffix("_g16").endswith("_o")
+        has_bias = "_b_" in op
+        mods = op.removeprefix("image_sample").removesuffix("_g16").replace("_", ".")
+        prefix = f"llvm.amdgcn.image.sample{mods}.2d.v4f32"
+        precision = ".f16" if g16 else ".f32"
+        intrinsic = prefix + (precision if gradient else "") + ".f32" + (".f32" if has_bias else "")
         operands = [("float", "0.125", 0x3E000000), ("float", "0.375", 0x3EC00000), ("float", "1.25", 0x3FA00000)]
+        if gradient:
+            operands[0] = ("float", "0.1875", 0x3E400000)
+            slopes = (0.125, -0.25, 0.5, 1.0)
+            if g16:
+                halves = struct.unpack("<4H", struct.pack("<4e", *slopes))
+                gradient_args = [("half", f"0xH{bits:04X}", bits) for bits in halves]
+            else:
+                words = struct.unpack("<4I", struct.pack("<4f", *slopes))
+                gradient_args = [("float", str(value), word) for value, word in zip(slopes, words, strict=True)]
+            operands[:0] = gradient_args
         if has_bias:
             operands.insert(0, ("float", "-0.75", 0xBF400000))
         if has_offset:
@@ -180,29 +213,45 @@ define amdgpu_ps <4 x float> @order(<8 x i32> inreg %rsrc, <4 x i32> inreg %samp
         match = re.search(rf"{op} v\[\d+:\d+\], v\[(\d+):(\d+)\].*dim:SQ_RSRC_IMG_2D", asm)
         assert match and " a16" not in match[0], asm
         first, last = map(int, match.groups())
-        assert last - first + 1 == len(operands), match[0]
-        for reg, (_, _, bits) in enumerate(operands, first):
-            assert re.search(rf"v_mov_b32_e32 v{reg}, 0x{bits:x}\b", asm), asm
-        print(f"{op} LLVM intrinsic address order: " + ", ".join(f"0x{bits:08x}" for _, _, bits in operands))
+        words = [bits for _, _, bits in operands]
+        if g16:
+            start = int(has_offset)
+            a, b, c, d = words[start:start + 4]
+            words[start:start + 4] = [a | b << 16, c | d << 16]
+        assert last - first + 1 == len(words), match[0]
+        setup = asm[:match.start()]
+        for reg, bits in enumerate(words, first):
+            moves = re.findall(rf"v_mov_b32_e32 v{reg}, (\S+)", setup)
+            assert moves, asm
+            text = moves[-1]
+            assert not text.startswith("v"), asm
+            emitted = int(text, 0) if text.startswith("0x") else struct.unpack("<I", struct.pack("<f", float(text)))[0]
+            assert emitted == bits, asm
+        print(f"{op} LLVM intrinsic address order: " + ", ".join(f"0x{bits:08x}" for bits in words))
 
 
-def check_binary(directory, assembler, objcopy, library, llc):
-    check_intrinsic_order(directory, llc)
-    for op, (opcode, first) in FORMS.items():
-        lines = program(op, bias="-1.0")
+def check_binary(directory, assembler, objcopy, library, llc, *, gradient=False):
+    check_intrinsic_order(directory, llc, gradient=gradient)
+    forms = GRADIENT_FORMS if gradient else FORMS
+    for op, (base_or_opcode, first) in forms.items():
+        lines = clamped_gradient(op, ("0", "0.5", "0", "0")) if gradient else program(op, bias="-1.0")
         # LLVM MC requires the padded sequential tuple for a five-word address.
         assembly = [line.replace(f"v[{first}:10]", f"v[{first}:{first + 7}]")
-                    if line.startswith(op + " ") and first == 6 else line for line in lines]
+                    if line.startswith(op + " ") and first <= 6 else line for line in lines]
         data = assemble(directory, assembler, objcopy, assembly, cpu="gfx1030", features=FEATURES)
         decoded = pixel_aot.disassemble(data, library, cpu=b"gfx1030", features=FEATURES.encode(), offsets=True)
         image = [(pc, text) for pc, text in decoded if text.startswith("image_")]
         assert len(image) == 1 and image[0][1] == next(line for line in lines if line.startswith(op + " ")), image
         pc, _ = image[0]
         w0, w1 = struct.unpack_from("<2I", data, pc)
-        assert ((w0 >> 18) & 0x7f, w1 & 0xff, w0 & 0x6) == (opcode, first, 0), (op, hex(w0), hex(w1))
+        assert (w1 & 0xff, w0 & 0x6) == (first, 0), (op, hex(w0), hex(w1))
+        if not gradient:
+            assert (w0 >> 18) & 0x7f == base_or_opcode, (op, hex(w0))
         print(f"{op}: {data[pc:pc + 8].hex(' ')}")
         expected = translate(lines)
-        assert translate(decoded) == expected
+        actual = translate(decoded)
+        assert actual == expected, "".join(difflib.unified_diff(
+            expected.splitlines(keepends=True), actual.splitlines(keepends=True)))
         archive, output = directory / "fixture.bin", directory / "fixture.hlsl"
         archive.write_bytes(envelope(data))
         subprocess.run([sys.executable, "-B", pixel_aot.__file__, archive, "fixture", "--llvm", library,
@@ -263,13 +312,81 @@ def check_draw(directory, compiler, renderer=None, adapter=None):
                     draw(renderer, adapter, "--check-pixel-gather", mutated, case, mismatch=True)
 
 
+def check_gradient_controls():
+    slopes = ("0.125", "-0.25", "0.5", "1.0")
+    for op, (_, first) in GRADIENT_FORMS.items():
+        lines = clamped_gradient(op, slopes)
+        source = translate(lines)
+        offset = "int2(1, -1)" if "_o" in op else "int2(0, 0)"
+        assert f", {offset}, 1.0f);" in source and "tex.SampleGrad(" in source
+        rejects(lines, "requires --sample-clamp-mips", sample_clamp_mips=None)
+        rejects(clamped_gradient(op, slopes, floor="3.0"), "known minimum LOD inside the view")
+        rejects([line.replace(f"v[{first}:10]", f"v[{first}:9]") for line in lines], "width mismatch")
+        rejects([line.replace("IMG_2D", "IMG_2D a16") for line in lines], "Unsupported instruction")
+        rejects([line for line in lines if line != "s_waitcnt vmcnt(0)"], "Unsupported pack operand")
+        if "_cd" in op:
+            slope = first + ("_o" in op)
+            bad = "0x7c000000" if op.endswith("_g16") else "0x7f800000"
+            dynamic = [f"v_mov_b32_e32 v{slope}, {bad}" if line.startswith(f"v_mov_b32_e32 v{slope},") else line
+                       for line in lines]
+            rejects(dynamic, "finite slopes")
+
+
+def check_gradient_draw(directory, compiler, renderer=None, adapter=None):
+    case = directory / "gradient-clamp.case"
+    zero = ("0",) * 4
+    for op in GRADIENT_FORMS:
+        offset = (1, -1) if "_o" in op else (0, 0)
+        for name, slopes, mip, wrong_mip in (
+            ("raised", ("0", "-0.125", "0", "0"), 1, 0),
+            ("higher", ("0", "0", "0.5", "0"), 2, 1),
+        ):
+            stem = f"{op}_{name}"
+            source = translate(clamped_gradient(op, slopes))
+            shader = compile_ps(compiler, source, directory, stem)
+            dxil = subprocess.run([compiler, "-dumpbin", shader], check=True, capture_output=True, text=True).stdout
+            call = re.search(r"call .* @dx\.op\.sampleGrad\.f32\(([^)\n]+)\)", dxil)
+            assert call, dxil
+            args = call[1].split(", ")
+            assert float(args[-1].removeprefix("float ")) == 1.0, call[0]
+            assert args[7:9] == [f"i32 {component}" for component in offset], call[0]
+            direct = compile_ps(compiler, direct_hlsl(1, mip, offset), directory, stem + "_direct")
+            wrong = (clamped_gradient(op, slopes, floor="0.0") if name == "raised"
+                     else clamped_gradient(op, zero))
+            mutated = compile_ps(compiler, translate(wrong), directory, stem + "_mutated")
+            expected = reference(mip, 1, offset)
+            mutation = reference(wrong_mip, 1, offset)
+            assert expected[0][0] != mutation[0][0]
+            if renderer is not None:
+                case.write_bytes(case_data(expected))
+                draw(renderer, adapter, "--check-pixel-gather", shader, case)
+                draw(renderer, adapter, "--check-pixel-gather", direct, case)
+                case.write_bytes(case_data(mutation))
+                draw(renderer, adapter, "--check-pixel-gather", mutated, case)
+                case.write_bytes(case_data(expected))
+                draw(renderer, adapter, "--check-pixel-gather", mutated, case, mismatch=True)
+            print(f"{stem} mutation (0,0) red expected={expected[0][0]} actual={mutation[0][0]}")
+
+
 if __name__ == "__main__":
-    check_reference()
-    check_lowering()
-    if len(sys.argv) > 1:
-        mode, *args = sys.argv[1:]
+    mode = sys.argv[1] if len(sys.argv) > 1 else "controls"
+    gradient = mode.endswith("-gradient")
+    mode = mode.removesuffix("-gradient")
+    if gradient:
+        check_gradient_controls()
+    else:
+        check_reference()
+        check_lowering()
+    if mode != "controls":
+        args = sys.argv[2:]
         out = Path(__file__).resolve().parents[1] / "out"
         out.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="sample-clamp-", dir=out) as tmp:
-            {"binary": check_binary, "compile": check_draw, "draw": check_draw}[mode](Path(tmp), *args)
-    print("Four 2D minimum-LOD sample forms checked")
+            if mode == "binary":
+                check_binary(Path(tmp), *args, gradient=gradient)
+            elif mode in ("compile", "draw"):
+                (check_gradient_draw if gradient else check_draw)(Path(tmp), *args)
+            else:
+                raise ValueError(f"Unknown mode {mode!r}")
+    print("Eight 2D minimum-LOD gradient sample forms checked" if gradient else
+          "Four 2D minimum-LOD sample forms checked")

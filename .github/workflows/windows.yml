@@ -49,6 +49,7 @@ jobs:
               (["tests/pixel_compare_gather_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1"], {}),
               (["tests/pixel_gather_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1"], {}),
               (["tests/pixel_sample_clamp_check.py", *COMMON_LLVM, "llc-15"], {}),
+              (["tests/pixel_sample_clamp_check.py", "binary-gradient", *COMMON_LLVM[1:], "llc-15"], {}),
               (["tests/pixel_sample_gradient_check.py", *COMMON_LLVM, "llc-15"], {}),
               (["tests/pixel_sample_gradient_check.py", "binary-coarse", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1", "llc-15"], {}),
               (["tests/depth_mask_check.py", *COMMON_LLVM], {}),

@@ -3519,9 +3519,8 @@ minimum LOD, and maximum LOD at or above the last view mip. The instruction
 clamp must be a known finite float in `[0, N-1]`. The instruction bias, when
 present, must be a known float in the HLSL range `[-16, 15.99]`. The draw
 cases use integral LODs and avoid point mip ties. Fractional and near-tie
-native rounding remain unmeasured. Comparison, explicit gradient, gather,
-NSA, `a16`, `d16`, runtime LOD operands and other sampler profiles are outside
-this experiment.
+native rounding remain unmeasured. Comparison, gather, NSA, `a16`, `d16`, runtime LOD operands and other sampler
+profiles are outside this experiment.
 
 **Source discrepancy.** The [AMD RDNA 2 reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture),
 Table 44, says `_CL` clamps computed LOD “to be no larger than this value.”
@@ -3576,6 +3575,36 @@ negative bias case that distinguishes bias-before-clamp from the opposite
 order. Desktop DXIL readback tests the Direct3D implementation. The test
 registration omits form coverage records while the native direction remains
 unresolved.
+
+### Experimental gfx1030 2D gradient minimum LOD
+
+The ordinary minimum-LOD profile also accepts `image_sample_d_cl`,
+`image_sample_d_cl_o`, `image_sample_cd_cl`, `image_sample_cd_cl_o`, and
+the four corresponding `_g16` forms. The full-precision or packed gradient
+words precede the full-width UV pair. The clamp follows UV. The coarse forms
+retain the existing restriction to statically known finite slope words.
+The lowering supplies the ordered gradient vectors, an immediate offset and
+an immediate minimum LOD to `SampleGrad`.
+
+The desktop fixture uses three spatially distinct mips. When the gradient
+implies mip 0, clamp 1 selects mip 1. When the gradient implies mip 2, the
+same clamp leaves mip 2 selected. Translated output and an independent
+`SampleLevel` shader match the full CPU readback. Dropping the clamp first
+changes red at `(0,0)` from `0.5` to `0.25`. Zeroing the high gradient first
+changes red there from `0.75` to `0.5`. The CPU model also predicts every
+pixel of each mutated draw. LLVM 15 code generation checks the address
+order and all eight encodings round-trip through the container CLI.
+
+```sh
+python3 -B tests/pixel_sample_clamp_check.py binary-gradient llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1 llc-15
+```
+
+```powershell
+ctest --preset dev --no-tests=error -j 1 -R '^pixel_aot_sample_gradient_clamp_(warp|hardware)$' -V
+```
+
+The same native publication gate applies. Capture both below-clamp and
+above-clamp cases for each encoding before recording semantic coverage.
 
 ### gfx1030 2D image gathers
 

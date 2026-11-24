@@ -6232,6 +6232,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_sample_clamp_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_sample_clamp_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME pixel_aot_sample_gradient_clamp_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_sample_clamp_check.py" draw-gradient "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" "${adapter}")
+        set_tests_properties(pixel_aot_sample_gradient_clamp_${adapter} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         add_test(NAME pixel_aot_sample_gradient_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_sample_gradient_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

@@ -4172,7 +4172,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     vector[dst] = f"uv.{component}" if mask == "quad" else ("entry_uv", component)
             else:
                 raise ValueError("Unpaired interpolation")
-        elif m := match(r"(image_sample(?:(?:_lz|_l|_b|_cl|_b_cl)?(?:_o)?|_c?d(?:_o)?(?:_g16)?)) (?:v\[(\d+):(\d+)\]|v(\d+)), "
+        elif m := match(r"(image_sample(?:(?:_lz|_l|_b|_cl|_b_cl)?(?:_o)?|_c?d(?:_cl)?(?:_o)?(?:_g16)?)) (?:v\[(\d+):(\d+)\]|v(\d+)), "
                         r"v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x([1-9a-f]) dim:SQ_RSRC_IMG_2D"):
             op, dst_first, dst_last, dst_single, *rest, dmask_hex = m.groups()
             dmask = int(dmask_hex, 16)
@@ -4182,17 +4182,18 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             sample_op = op.removesuffix("_g16")
             base_op = sample_op.removesuffix("_o")
             has_offset = sample_op != base_op
-            coarse = base_op == "image_sample_cd"
-            gradient = coarse or base_op == "image_sample_d"
+            has_clamp = base_op.endswith("_cl")
+            gradient_op = base_op.removesuffix("_cl")
+            coarse = gradient_op == "image_sample_cd"
+            gradient = coarse or gradient_op == "image_sample_d"
             if coarse and cpu != "gfx1030":
                 raise ValueError("Coarse-gradient sampling requires gfx1030")
-            has_clamp = base_op.endswith("_cl")
             has_bias = base_op in ("image_sample_b", "image_sample_b_cl")
             if has_clamp and sample_clamp_mips is None:
                 raise ValueError(f"{op} requires --sample-clamp-mips")
             if gradient:
                 # LLVM disassembly lists only the live address operands.
-                coord_width = (4 if g16 else 6) + has_offset
+                coord_width = (4 if g16 else 6) + has_offset + has_clamp
             else:
                 coord_width = 2 + (base_op == "image_sample_l" or has_bias) + has_offset + has_clamp
             channels = ["xyzw"[bit] for bit in range(4) if (dmask >> bit) & 1]
@@ -4282,7 +4283,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     dudx, dvdx, dudy, dvdy = [sample_coord(reg) for reg in coord_regs[:4]]
                     ddx = f"float2({dudx}, {dvdx})"
                     ddy = f"float2({dudy}, {dvdy})"
-                call = f"SampleGrad(samp, float2({u}, {v}), {ddx}, {ddy}{offset_arg})"
+                call = f"SampleGrad(samp, float2({u}, {v}), {ddx}, {ddy}{offset_arg}{clamp_arg})"
             elif base_op in ("image_sample_lz", "image_sample_l"):
                 u, v = [sample_coord(reg) for reg in coord_regs[:2]]
                 lod = sample_coord(coord_regs[2]) if base_op == "image_sample_l" else "0.0f"
