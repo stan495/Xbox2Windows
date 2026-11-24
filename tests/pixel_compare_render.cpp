@@ -20,7 +20,7 @@ struct CompareCase {
     std::vector<std::array<float, 4>> expected;
 };
 
-CompareCase read_case(const char* path)
+CompareCase read_case(const char* path, UINT mipLevels)
 {
     std::ifstream file(path, std::ios::binary);
     if (!file) throw std::runtime_error("Cannot open comparison case");
@@ -40,7 +40,11 @@ CompareCase read_case(const char* path)
          c.filter != D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT))
         throw std::runtime_error("Invalid comparison case header");
     file.read(reinterpret_cast<char*>(c.constants.data()), sizeof(c.constants));
-    c.depths.resize(size_t(c.texWidth) * c.texHeight);
+    if (mipLevels == 2 && (c.texWidth < 2 || c.texHeight < 2))
+        throw std::runtime_error("Two-mip comparison case needs both texture dimensions at least 2");
+    size_t texels = size_t(c.texWidth) * c.texHeight;
+    if (mipLevels == 2) texels += size_t(c.texWidth / 2) * (c.texHeight / 2);
+    c.depths.resize(texels);
     file.read(reinterpret_cast<char*>(c.depths.data()), std::streamsize(c.depths.size() * sizeof(float)));
     c.expected.resize(size_t(c.width) * c.height);
     file.read(reinterpret_cast<char*>(c.expected.data()), std::streamsize(c.expected.size() * 16));
@@ -61,9 +65,10 @@ ComPtr<ID3D12Resource> upload_bytes(ID3D12Device* device, const void* data, UINT
 }
 }
 
-void check_pixel_compare(ID3D12Device* device, const char* shader, const char* casePath)
+void check_pixel_compare(ID3D12Device* device, const char* shader, const char* casePath, bool twoMips)
 {
-    const auto c = read_case(casePath);
+    const UINT mipLevels = twoMips ? 2 : 1;
+    const auto c = read_case(casePath, mipLevels);
     std::ifstream stream(shader, std::ios::binary);
     std::vector<char> ps{std::istreambuf_iterator<char>(stream), {}};
     if (ps.empty()) throw std::runtime_error("Cannot read compiled pixel shader");
@@ -113,16 +118,25 @@ void check_pixel_compare(ID3D12Device* device, const char* shader, const char* c
     texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     texDesc.Width = c.texWidth;
     texDesc.Height = c.texHeight;
-    texDesc.DepthOrArraySize = texDesc.MipLevels = texDesc.SampleDesc.Count = 1;
+    texDesc.DepthOrArraySize = texDesc.SampleDesc.Count = 1;
+    texDesc.MipLevels = static_cast<UINT16>(mipLevels);
     texDesc.Format = DXGI_FORMAT_R32_FLOAT;
     auto texture = resource(device, texDesc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT texLayout{};
+    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 2> texLayouts{};
     UINT64 texBytes = 0;
-    device->GetCopyableFootprints(&texDesc, 0, 1, 0, &texLayout, nullptr, nullptr, &texBytes);
+    device->GetCopyableFootprints(&texDesc, 0, mipLevels, 0, texLayouts.data(), nullptr, nullptr, &texBytes);
     std::vector<char> staged(static_cast<size_t>(texBytes));
-    for (UINT y = 0; y < c.texHeight; ++y)
-        std::memcpy(staged.data() + texLayout.Offset + size_t(y) * texLayout.Footprint.RowPitch,
-                    c.depths.data() + size_t(y) * c.texWidth, c.texWidth * sizeof(float));
+    size_t texelOffset = 0;
+    for (UINT mip = 0; mip < mipLevels; ++mip) {
+        const auto& layout = texLayouts[mip];
+        const UINT width = c.texWidth >> mip;
+        const UINT height = c.texHeight >> mip;
+        for (UINT y = 0; y < height; ++y) {
+            std::memcpy(staged.data() + layout.Offset + size_t(y) * layout.Footprint.RowPitch,
+                        c.depths.data() + texelOffset + size_t(y) * width, width * sizeof(float));
+        }
+        texelOffset += size_t(width) * height;
+    }
     auto staging = upload_bytes(device, staged.data(), texBytes);
     auto constants = upload_bytes(device, c.constants.data(), sizeof(c.constants));
 
@@ -138,7 +152,7 @@ void check_pixel_compare(ID3D12Device* device, const char* shader, const char* c
     sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     sampler.MaxAnisotropy = 1;
     sampler.ComparisonFunc = D3D12_COMPARISON_FUNC(c.func);
-    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.MaxLOD = twoMips ? 1.0f : D3D12_FLOAT32_MAX;
     device->CreateSampler(&sampler, samplers->GetCPUDescriptorHandleForHeapStart());
     heapDesc = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
     check(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&rtvs)), "Comparison target heap");
@@ -162,10 +176,13 @@ void check_pixel_compare(ID3D12Device* device, const char* shader, const char* c
     D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
     src.pResource = staging.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint = texLayout;
     dst.pResource = texture.Get();
     dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    for (UINT mip = 0; mip < mipLevels; ++mip) {
+        src.PlacedFootprint = texLayouts[mip];
+        dst.SubresourceIndex = mip;
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
     transition(list, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     ID3D12DescriptorHeap* heaps[]{views.Get(), samplers.Get()};
     list->SetDescriptorHeaps(2, heaps);
