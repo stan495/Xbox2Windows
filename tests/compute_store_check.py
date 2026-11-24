@@ -3171,6 +3171,86 @@ def mubuf_reduction_draw(directory, compiler, renderer, backend, wide=False):
     return 0
 
 
+MUBUF_EXCHANGE_DATA = (0x89abcdef, 0x12345678)
+
+
+def mubuf_exchange_cases(wide=False):
+    for op in ("swap", "cmpswap"):
+        name = f"buffer_atomic_{op}{'_x2' if wide else ''}"
+        width = 2 if wide else 1
+        count = 2 * width if op == "cmpswap" else width
+        data = f"v[10:{9 + count}]" if count > 1 else "v10"
+        lines = ["s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
+                 "s_load_dwordx4 s[20:23], s[12:13], 0x30", "s_waitcnt lgkmcnt(0)"]
+        words = MUBUF_EXCHANGE_DATA[:width] + (SENTINEL,) * (count - width)
+        lines += [f"v_mov_b32_e32 v{10 + i}, {word:#x}" for i, word in enumerate(words)]
+        lines += [f"{name} {data}, off, s[20:23], 0 offset:8", "s_endpgm"]
+        yield name, lines, {k: v for k, v in DS_BINDING.items() if k != "stride"}
+
+
+def mubuf_exchange_controls(wide):
+    _, lines, binding = list(mubuf_exchange_cases(wide))[-1]
+    atomic = lines[-2]
+    for replacement, diagnostic in (
+        (atomic.replace(atomic.split()[1], "v10,"), "Unverified atomic reduction data range"),
+        (atomic + " glc", "Unsupported compute instruction"),
+    ):
+        rejects(diagnostic, aot.lower, variant(lines, (atomic, replacement)), 32, **binding)
+    rejects("Atomic reduction data is not a known word", aot.lower,
+            variant(lines, (lines[-3], "")), 32, **binding)
+
+
+def mubuf_exchange_draw(directory, compiler, renderer, backend, wide=False):
+    mubuf_exchange_controls(wide)
+    src, cso, case = (directory / f"mubuf-exchange.{ext}" for ext in ("hlsl", "cso", "case"))
+    compile_shader = [compiler, "-T", "cs_6_6" if wide else "cs_6_0", "-E", "main", "-Fo", cso, src]
+    runner = "--compute-store-case-atomic64" if wide else "--compute-store-case"
+    run = [renderer, backend, runner, cso, case]
+    width = 2 if wide else 1
+    accepted = []
+    for name, lines, binding in mubuf_exchange_cases(wide):
+        print(name, flush=True)
+        compare = "cmpswap" in name
+        for match in ((True, False) if compare else (True,)):
+            program = lines if match else variant(lines, (lines[-3], lines[-3].replace(f"{SENTINEL:#x}", "0")))
+            src.write_text(aot.lower(program, 32, **binding), encoding="ascii")
+            subprocess.run(compile_shader, check=True)
+            words = [SENTINEL] * 320
+            if match:
+                words[2:2 + width] = MUBUF_EXCHANGE_DATA[:width]
+            for groups in (1, 2):
+                case.write_bytes(struct.pack("<321I", groups, *words))
+                result = subprocess.run(run)
+                if result.returncode:
+                    return result.returncode
+        # This still makes a valid exchange, but writes the target or its neighbor incorrectly.
+        if compare:
+            pair = [line for line in lines if line.startswith("v_mov_b32_e32")]
+            changed = list(lines)
+            for i in range(width * 2):
+                j = lines.index(pair[i])
+                repl = pair[(i + width) % (width * 2)].split(", ")[-1]
+                changed[j] = pair[i].split(", ")[0] + ", " + repl
+            mismatch, expected, actual = 2, MUBUF_EXCHANGE_DATA[0], SENTINEL
+        else:
+            changed = variant(lines, ("offset:8", "offset:0"))
+            mismatch, expected, actual = 0, SENTINEL, MUBUF_EXCHANGE_DATA[0]
+        words[2:2 + width] = MUBUF_EXCHANGE_DATA[:width]
+        case.write_bytes(struct.pack("<321I", 2, *words))
+        src.write_text(aot.lower(changed, 32, **binding), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        result = subprocess.run(run, capture_output=True, text=True)
+        if result.returncode != 1 or f"word={mismatch} expected={expected:08x} actual={actual:08x}" not in result.stderr:
+            raise AssertionError(f"{name}: incorrect exchange escaped detection\n{result.stderr}")
+        print(result.stderr, end="")
+        accepted.append(name)
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(accepted) + "\n", encoding="utf-8")
+    return 0
+
+
 def scalar_alu_binary(directory, assembler, objcopy, library):
     """The assembled scalar chain decodes to the same program as its text."""
     src, obj, raw = [directory / x for x in ("scalar.s", "scalar.o", "scalar.bin")]
@@ -3197,6 +3277,8 @@ def binary(directory, assembler, objcopy, library):
     mubuf_reduction_x2_controls()
     for wide in (False, True):
         gfx1030_binary(directory, assembler, objcopy, library, mubuf_reduction_cases(wide), "buffer_atomic_")
+        mubuf_exchange_controls(wide)
+        gfx1030_binary(directory, assembler, objcopy, library, mubuf_exchange_cases(wide), "buffer_atomic_")
     mubuf_subword_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_subword_cases(), "buffer_load_")
     mubuf_vector_controls()
@@ -4940,6 +5022,8 @@ if __name__ == "__main__":
         modes = {"binary": binary, "draw": draw,
                  "draw-mubuf-subword": mubuf_subword_draw,
                  "draw-mubuf-reduction": mubuf_reduction_draw,
+                 "draw-mubuf-exchange": mubuf_exchange_draw,
+                 "draw-mubuf-exchange-x2": lambda d, *a: mubuf_exchange_draw(d, *a, wide=True),
                  "draw-mubuf-reduction-x2": lambda d, *a: mubuf_reduction_draw(d, *a, wide=True),
                  "draw-mubuf-vector": mubuf_vector_draw,
                  "draw-mubuf-d16": mubuf_d16_draw,

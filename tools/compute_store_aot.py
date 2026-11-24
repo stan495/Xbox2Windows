@@ -92,9 +92,10 @@ LDS_RMW = {
     "ds_max_u32": "max({0}, {1})",
 }
 
-MUBUF_ATOMIC_REDUCTIONS = {
+MUBUF_ATOMIC_METHODS = {
     "add": "Add", "sub": "Add", "and": "And", "or": "Or", "xor": "Xor",
     "smin": "Min", "umin": "Min", "smax": "Max", "umax": "Max",
+    "swap": "Exchange", "cmpswap": "CompareExchange",
 }
 
 
@@ -253,7 +254,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     # they enter vector only at s_waitcnt vmcnt(0).
     loading = {}
     stores = []
-    atomic_reduction = False
+    atomic_update = False
     # DS operations and image loads can consume each other's temporaries. Keep them in instruction order.
     staged_steps = []
     ds_step_count = 0
@@ -1217,7 +1218,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 reg = first + index
                 vector.pop(reg, None)
                 loading[reg] = ("alu", f"{name}.{component}")
-        elif m := re.fullmatch(rf"buffer_atomic_({'|'.join(MUBUF_ATOMIC_REDUCTIONS)})(_x2)? "
+        elif m := re.fullmatch(rf"buffer_atomic_({'|'.join(MUBUF_ATOMIC_METHODS)})(_x2)? "
                                r"(v\d+|v\[\d+:\d+\]), off, s\[(\d+):(\d+)\], 0(?: offset:(\d+))?", line):
             if cpu != "gfx1030" or stride is not None or output_format is not None:
                 raise ValueError("Unsupported atomic reduction target or binding")
@@ -1232,14 +1233,17 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             if offset > 4095 or offset % (8 if wide else 4):
                 raise ValueError("Unverified atomic reduction address")
             src, *last = map(int, re.findall(r"\d+", m[3]))
-            count = 2 if wide else 1
-            if last != ([src + 1] if wide else []) or src + count > 256:
+            width = 2 if wide else 1
+            count = 2 * width if op == "cmpswap" else width
+            if last != ([src + count - 1] if count > 1 else []) or src + count > 256:
                 raise ValueError("Unverified atomic reduction data range")
             values = [vector.get(reg) for reg in range(src, src + count)]
             if not all(is_word(value) for value in values):
                 raise ValueError("Atomic reduction data is not a known word")
             words = list(map(hlsl_word, values))
-            word = f"(uint64_t({words[0]}) | (uint64_t({words[1]}) << 32u))" if wide else words[0]
+            operands = ([f"(uint64_t({lo}) | (uint64_t({hi}) << 32u))" for lo, hi in zip(words[::2], words[1::2])]
+                        if wide else words)
+            word = operands[0]
             signed = op in ("smin", "smax")
             if signed:
                 word = f"int64_t({word})" if wide else f"asint({word})"
@@ -1247,17 +1251,20 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 word = f"({'0ull' if wide else '0u'} - {word})"
             # Both overloads discard the old value. Raw UAV atomics on pairs require SM 6.6.
             kind = ("int64_t" if signed else "uint64_t") if wide else ("int" if signed else "uint")
-            method = MUBUF_ATOMIC_REDUCTIONS[op] + ("64" if wide else "")
+            method = MUBUF_ATOMIC_METHODS[op] + ("64" if wide else "")
+            if op == "cmpswap":
+                # The ISA places replacement before compare, unlike the HLSL argument order.
+                word = f"{operands[1]}, {word}"
             stores.extend((f"    {kind} ignoredAtomic;",
                            f"    outputData.Interlocked{method}({offset}u, {word}, ignoredAtomic);"))
-            atomic_reduction = True
+            atomic_update = True
         elif m := re.fullmatch(r"(?:buffer_store_(?:dword(?:x(?P<raw_count>[234]))?|(?P<subword>byte|short)(?P<store_hi>_d16_hi)?)|"
                                r"(?P<typed>t)?buffer_store_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
                                r"(?P<data>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+|v\[\d+:\d+\]), "
                                r"s\[(?P<base>\d+):(?P<high>\d+)\], 0"
                                r"(?(typed) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
                                r"(?P<idxen> idxen)?(?P<offen> offen)?(?: offset:(?P<offset>\d+))?", line):
-            if atomic_reduction:
+            if atomic_update:
                 raise ValueError("An atomic reduction must be the only UAV operation")
             channels = m["channels"]
             packed = channels is not None and channels.startswith("d16_")

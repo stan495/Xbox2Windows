@@ -3516,6 +3516,29 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_reduction_x2_' -V
 ```
 
+### gfx1030 fixed-address MUBUF atomic exchanges
+
+The compute store profile also lowers `buffer_atomic_swap`,
+`buffer_atomic_cmpswap`, and their `_x2` forms with `glc` clear. The
+[AMD RDNA 2 Shader ISA](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf)
+defines the replacement VGPR or pair before the comparison VGPR or pair.
+The translator passes the comparison first to `InterlockedCompareExchange`.
+The existing fixed-address descriptor, alignment and sole-UAV-operation
+constraints apply. Compile the 64-bit forms with `cs_6_6`.
+
+Source-built wave32 fixtures use identical operands in every lane to make
+the final word or pair deterministic across one and two dispatch groups.
+Compare-swap exercises a matching and a non-matching comparison. The CPU
+reference checks all 320 output words. An address mutation moves the swap
+to the preceding word pair, and reversing compare-swap operands leaves
+the target unchanged. LLVM 15 exercises all four forms through the
+compute-container CLI. WARP and physical GPU tests execute translated DXIL.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_exchange' -V
+```
+
 ### Indexed gfx1030 raw vector reads
 
 The compute store profile also lowers `buffer_load_dwordx2`,
