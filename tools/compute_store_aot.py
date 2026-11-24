@@ -1025,7 +1025,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified row pitch byte offset")
             vector[dst] = ("pitch_bytes", row_tag[1], int(pitch, 0), *column_tag[1:])
-        elif m := re.fullmatch(r"(?:buffer_load_(?:dword(?:x(?P<raw_count>[234]))?|(?P<subword>[us](?:byte|short)))"
+        elif m := re.fullmatch(r"(?:buffer_load_(?:dword(?:x(?P<raw_count>[234]))?|(?P<subword>[us](?:byte|short))"
+                               r"|(?P<d16_kind>[us]byte|short)_d16(?P<hi>_hi)?)"
                                r"|tbuffer_load_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
                                r"(?P<dst>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+), s\[(?P<base>\d+):(?P<high>\d+)\], 0"
                                r"(?(channels) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
@@ -1040,7 +1041,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             base, high = int(m["base"]), int(m["high"])
             offset = int(m["offset"] or 0)
             addr, idxen, offen = m["addr"], m["idxen"], m["offen"]
-            subword = m["subword"]
+            d16_kind = m["d16_kind"]
+            subword = m["subword"] or d16_kind
             width = 4 if subword is None else 1 if subword.endswith("byte") else 2
             if subword and (cpu != "gfx1030" or not idxen or offen):
                 raise ValueError("Unsupported subword buffer read target or address mode")
@@ -1054,6 +1056,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Unsupported typed buffer read format")
             if last != ([] if count == 1 else [dst + count - 1]) or dst + count > 256:
                 raise ValueError("Unverified buffer read destination")
+            old = vector.get(dst) if d16_kind else None
+            if d16_kind and not is_word(old):
+                raise ValueError("Unverified D16 buffer read destination input")
             if (high != base + 3 or base % 4 or high > 105
                     or pending.intersection(range(base, high + 1))):
                 raise ValueError("Unverified buffer read descriptor")
@@ -1091,9 +1096,15 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     # The stride and SRV base are DWORD-aligned, so the enclosing word stays in the record.
                     bits, shift = width * 8, (offset % 4) * 8
                     field = f"(({hlsl_word(word)} >> {shift}u) & {((1 << bits) - 1):#x}u)"
-                    if subword.startswith("s"):
+                    if subword in ("sbyte", "sshort"):
                         sign = f"{1 << (bits - 1):#x}u"
                         field = f"(({field} ^ {sign}) - {sign})"
+                    if d16_kind:
+                        hi = bool(m["hi"])
+                        keep = "0xffffu" if hi else "0xffff0000u"
+                        field = f"(({hlsl_word(old)} & {keep}) | (({field} & 0xffffu) << {16 if hi else 0}u))"
+                        if len(field) > ALU_EXPRESSION_LIMIT:
+                            raise ValueError("D16 buffer read expression is too large")
                     word = ("alu", field)
                 loading[reg] = word
         elif m := re.fullmatch(r"(?:buffer_store_dword(?:x([234]))?|"

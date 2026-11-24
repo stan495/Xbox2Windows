@@ -3150,7 +3150,8 @@ record. The `t0` raw view base and the explicit source stride are DWORD
 aligned. The translator loads the containing DWORD, then extracts and
 zero- or sign-extends the selected field. The descriptor needs
 `lgkmcnt(0)` and the result needs `vmcnt(0)` before use. Other address
-modes, modifiers, D16 operations and reads from the output UAV are refused.
+modes, modifiers and reads from the output UAV are refused. Raw D16 partial
+register writes have a separate contract below.
 The caller supplies stable, disjoint, fully in-range source records with
 no swizzle; this profile does not emulate native descriptor bounds.
 
@@ -3201,6 +3202,46 @@ tests execute the translated desktop DXIL, not the native programs.
 ```powershell
 cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_vector_' -V
+```
+
+```sh
+python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+### Indexed gfx1030 raw D16 reads
+
+The compute store profile lowers `buffer_load_ubyte_d16`,
+`buffer_load_sbyte_d16`, and `buffer_load_short_d16`, including their three
+`_hi` variants. These are raw byte and short operations, not typed format
+conversions. The [AMD RDNA 2 Shader ISA](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf),
+sections 8.1.6 and 12.14 (MUBUF opcodes 32 through 37), specifies which half each operation writes. A byte
+is zero- or sign-extended to 16 bits; a short is copied as is. The other
+half of the destination VGPR is retained. This profile requires a known
+full destination word before the load. It will not use the undefined upper
+half of an odd packed MTBUF load as an input word.
+
+The profile accepts only `idxen`, a verified dispatch-thread index, zero
+scalar offset and a naturally aligned immediate within one DWORD-aligned
+source record. The caller supplies a stable read-only raw `t0` with valid,
+unswizzled, in-range records disjoint from the output. Native descriptor
+bounds, formatted MUBUF and cache/status modifiers are not implemented by
+these operations. The descriptor and the VGPR result still need their
+respective `lgkmcnt(0)` and `vmcnt(0)` waits.
+
+Each wave32 fixture reads one source DWORD as the destination input, waits
+for it, and uses the next DWORD of the record for the D16 load. It stores
+the resulting full word after a second wait. The CPU reference builds each
+word from little-endian byte slices and checks all 320 output words,
+including gaps and untouched tail, after one and three groups. Clearing
+the preserved half, or zero-extending a signed byte, must mismatch first
+at output word 1. Controls also reject an unknown destination input, a
+misaligned short, a record overrun and a missing wait. LLVM 15 assembles
+all six fixtures and checks their container CLI HLSL against direct
+lowering. The dispatches execute translated desktop DXIL.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_d16_' -V
 ```
 
 ```sh
