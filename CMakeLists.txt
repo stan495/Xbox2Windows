@@ -5765,6 +5765,12 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME pixel_aot_sample_clamp_compile COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/pixel_sample_clamp_check.py" compile "${DXC_EXECUTABLE}")
     set_tests_properties(pixel_aot_sample_clamp_compile PROPERTIES TIMEOUT 90)
+    foreach(mode IN ITEMS plain bias)
+        set(test_name pixel_aot_compare_clamp_compile_${mode})
+        add_test(NAME ${test_name} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_compare_clamp_check.py" compile "${mode}" "${DXC_EXECUTABLE}")
+        set_tests_properties(${test_name} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     add_test(NAME rdna2_tools_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/rdna2_tools_check.py")
     add_test(NAME pso_readiness_check COMMAND "${INTAKE_PYTHON}" -B
@@ -6473,6 +6479,13 @@ if(EXISTS "${INTAKE_PYTHON}")
                 "$<TARGET_FILE:offscreen_check>" "${adapter}")
             set_tests_properties(${test_name} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
                 ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/${test_name}.txt")
+        endforeach()
+        foreach(mode IN ITEMS plain bias)
+            set(test_name pixel_aot_compare_clamp_${mode}_${adapter})
+            add_test(NAME ${test_name} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/pixel_compare_clamp_check.py" draw "${mode}" "${DXC_EXECUTABLE}"
+                "$<TARGET_FILE:offscreen_check>" "${adapter}")
+            set_tests_properties(${test_name} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         endforeach()
         add_test(NAME pixel_aot_compare_sample_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_compare_sample_check.py" draw "${DXC_EXECUTABLE}"
