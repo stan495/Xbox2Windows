@@ -4359,7 +4359,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             vector_loads += 1
             vector[dst] = f"alu{i}"
             sample_dest[dst] = vector_loads
-        elif m := match(r"(image_sample_c(?:(?:_lz|_l|_b|_cl|_b_cl)?(?:_o)?|_d(?:_o)?(?:_g16)?)) "
+        elif m := match(r"(image_sample_c(?:(?:_lz|_l|_b|_cl|_b_cl)?(?:_o)?|_c?d(?:_o)?(?:_g16)?)) "
                         r"(v\d+), (?:v\[(\d+):(\d+)\]|\[(v\d+), (v\d+), (v\d+)\]), "
                         r"s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x1 dim:SQ_RSRC_IMG_2D"):
             # RDNA 2 orders the address as offset, bias, reference, gradients, UV, explicit LOD.
@@ -4375,7 +4375,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             base_op = stem.removesuffix("_cl")
             if has_clamp and sample_clamp_mips != 2:
                 raise ValueError("Comparison clamp requires --sample-clamp-mips 2")
-            gradient_words = (2 if g16 else 4) if base_op == "image_sample_c_d" else 0
+            coarse = base_op == "image_sample_c_cd"
+            if coarse and cpu != "gfx1030":
+                raise ValueError("Coarse comparison gradients require gfx1030")
+            gradient_words = (2 if g16 else 4) if coarse or base_op == "image_sample_c_d" else 0
             explicit_lod = base_op in ("image_sample_c_lz", "image_sample_c_l")
             implicit_derivatives = not (explicit_lod or gradient_words)
             has_level_operand = base_op in ("image_sample_c_l", "image_sample_c_b")
@@ -4467,7 +4470,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             reference, u, v = values
             method = {"image_sample_c_lz": "SampleCmpLevelZero", "image_sample_c_l": "SampleCmpLevel",
                       "image_sample_c_b": "SampleCmpBias", "image_sample_c_d": "SampleCmpGrad",
-                      "image_sample_c": "SampleCmp"}[base_op]
+                      "image_sample_c_cd": "SampleCmpGrad", "image_sample_c": "SampleCmp"}[base_op]
             lines.append(f"    float sample{i} = tex.{method}(samp, float2({u}, {v}), "
                          f"{reference}{extra_args}{offset_arg}{clamp_arg});")
             samples += 1
