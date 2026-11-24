@@ -76,6 +76,7 @@ jobs:
               (["tests/startup_flat_param_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_bit_alu_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_inline_sampler_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/pixel_sample_clamp_check.py", *COMMON_LLVM, "llc-15"], {}),
           ]
 
           def run_one(item):

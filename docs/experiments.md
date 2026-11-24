@@ -3437,6 +3437,86 @@ ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_mimg_msaa_(warp|
 python3 -B tests/compute_mimg_msaa_check.py --binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
+### Experimental gfx1030 2D per-instruction minimum LOD
+
+The ordinary pixel path accepts the following full-width, non-comparison
+`dmask:0xf` Texture2D forms with sequential VGPRs. The output is four VGPRs,
+and the existing `vmcnt(0)` rule applies. Coordinates must retain whole-quad
+provenance. The offset is a known canonical packed XY DWORD, with signed
+six-bit fields at bits 5:0 and 13:8, limited to the DXIL range `[-8, 7]`.
+
+| Instruction | gfx1030 opcode | Active address DWORDs | Desktop HLSL |
+| --- | --- | --- | --- |
+| `image_sample_cl` | `0x21` | `u, v, clamp` | `Sample(s, uv, int2(0, 0), clamp)` |
+| `image_sample_cl_o` | `0x31` | `offset, u, v, clamp` | `Sample(s, uv, offset, clamp)` |
+| `image_sample_b_cl` | `0x26` | `bias, u, v, clamp` | `SampleBias(s, uv, bias, int2(0, 0), clamp)` |
+| `image_sample_b_cl_o` | `0x36` | `offset, bias, u, v, clamp` | `SampleBias(s, uv, bias, offset, clamp)` |
+
+`--cpu gfx1030 --sample-clamp-mips N` opts into this experiment. The caller
+must bind matching float 2D views of 1 to 16 visible mips and a normalized
+clamp-to-edge sampler with point XY and mip filters, zero sampler bias and
+minimum LOD, and maximum LOD at or above the last view mip. The instruction
+clamp must be a known finite float in `[0, N-1]`. The instruction bias, when
+present, must be a known float in the HLSL range `[-16, 15.99]`. The draw
+cases use integral LODs and avoid point mip ties. Fractional and near-tie
+native rounding remain unmeasured. Comparison, explicit gradient, gather,
+NSA, `a16`, `d16`, runtime LOD operands and other sampler profiles are outside
+this experiment.
+
+**Source discrepancy.** The [AMD RDNA 2 reference](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture),
+Table 44, says `_CL` clamps computed LOD “to be no larger than this value.”
+Table 43 and section 8.2.5 describe the address order. LLVM 15.0.7's
+[AMDGPU intrinsic definitions](https://github.com/llvm/llvm-project/blob/llvmorg-15.0.7/llvm/include/llvm/IR/IntrinsicsAMDGPU.td)
+append the operand named `clamp` after the coordinates, and its
+[MIMG instruction table](https://github.com/llvm/llvm-project/blob/llvmorg-15.0.7/llvm/lib/Target/AMDGPU/MIMGInstructions.td)
+assigns the four opcodes above. Those LLVM definitions establish the operand
+order and encoding. In Mesa 25.1.0, the
+[SPIR-V reader](https://github.com/chaotic-cx/mesa-mirror/blob/mesa-25.1.0/src/compiler/spirv/spirv_to_nir.c)
+maps `MinLod` to `nir_tex_src_min_lod`. The
+[ACO selector](https://github.com/chaotic-cx/mesa-mirror/blob/mesa-25.1.0/src/amd/compiler/aco_instruction_selection.cpp)
+selects the four `_cl` forms, and the
+[Mesa AMD LLVM builder](https://github.com/chaotic-cx/mesa-mirror/blob/mesa-25.1.0/src/amd/llvm/ac_llvm_build.c)
+appends `min_lod` to the `.cl` intrinsics. The
+[Vulkan scale-factor rules](https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html#textures-level-of-detail-operation)
+and [Direct3D per-sample MinLOD rules](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#5.9.4.5.4%20Per-sample%20MinLOD%20Clamp)
+define a lower bound on the biased LOD. The desktop experiment follows the
+compiler mapping and uses the native DXIL `Sample` and `SampleBias` clamp
+operands. AMD's pinned LLPC independently maps SPIR-V `MinLod` to the same
+AMDGPU intrinsics. [AMD LLPC SPIR-V reader](https://github.com/GPUOpen-Drivers/llpc/blob/40cb8d95ad8d6f7f1652e3fd47d39667594cce08/llpc/translator/lib/SPIRV/SPIRVReader.cpp#L7814) ·
+[AMD LLPC image builder](https://github.com/GPUOpen-Drivers/llpc/blob/40cb8d95ad8d6f7f1652e3fd47d39667594cce08/lgc/builder/ImageBuilder.cpp)
+
+The fixture checks four LLVM intrinsic-to-ISA argument orders with distinct
+literal words and four source assembly-to-container CLI round trips. The
+CPU model selects `max(implicit LOD + bias, clamp)` before point mip selection
+and predicts all 64 RGBA pixels from three spatially distinct mips. The
+translated shader and independent desktop `SampleLevel` oracle use the same
+texture, sampler and CPU reference. Controls drop the clamp, force the clamp
+as the LOD, drop the bias, apply it after the clamp, or remove the offset.
+For example, dropping the `_cl` clamp first changes pixel `(0,0)` red from
+`0.5` to `0.25` in the CPU model. The offline DXC check verifies the clamp,
+bias and nonzero offset operands in the emitted DXIL.
+
+```bash
+python3 -B tests/pixel_sample_clamp_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1 llc-15
+```
+
+```powershell
+ctest --preset dev --no-tests=error -R '^pixel_aot_sample_clamp_(controls|compile)$' -V
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -j 1 -R '^pixel_aot_sample_clamp_(warp|hardware)$' -V
+```
+
+**Native publication gate.** Before publishing opcode support or recording
+form coverage, capture the rendered mip identifiers from a source-built
+native gfx1030 pixel shader for all four opcodes. Use the same sampler and
+spatial mips, confirm the native instruction in the submitted shader's
+disassembly, and record device target, driver, shader hash and full readback.
+Use cases where the computed LOD is below and above the operand, plus the
+negative bias case that distinguishes bias-before-clamp from the opposite
+order. Desktop DXIL readback tests the Direct3D implementation. The test
+registration omits form coverage records while the native direction remains
+unresolved.
+
 ### gfx1030 2D image gathers
 
 The pixel AOT tool accepts `image_gather4`, `image_gather4_o`,
