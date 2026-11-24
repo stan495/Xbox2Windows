@@ -6223,6 +6223,48 @@ python3 -B tests/pixel_compare_sample_check.py binary llvm-mc-15 llvm-objcopy-15
 ctest --preset dev --no-tests=error -R '^pixel_aot_compare_sample_(warp|hardware)$' -V
 ```
 
+### gfx1030 2D comparison sample LOD and bias
+
+`image_sample_c_l` and `image_sample_c_l_o` lower to `SampleCmpLevel`.
+`image_sample_c_b` and `image_sample_c_b_o` lower to `SampleCmpBias`.
+The forms accept a contiguous sequence of full-width address VGPRs with an
+optional packed XY offset, an instruction bias for `_b`, the reference, U and V,
+and an explicit LOD for `_l`. Bias and LOD each accept binary32 `+0.0` and `1.0`
+when known statically. The bias forms require whole-quad UVs. The matching
+comparison sampler uses point XY and mip filtering, clamp-to-edge addressing,
+`MIN_LOD = 0`, `MAX_LOD = 1`, and no sampler LOD bias. Bind a 2D R32_FLOAT view
+with both mips visible and a desktop comparison sampler with the same LOD range.
+The forms use `dmask:0x1` and the existing reference range, offset and wait rules.
+
+The synthetic fixture uses different depth patterns in its 8×8 and 4×4 mips.
+It draws at 8×8 and 16×16 with a mip-zero footprint of one texel per pixel, so
+explicit LOD 1 and instruction bias +1 each select the second mip. A CPU model
+predicts all RGBA values, including where the signed offset `(1, -2)` clamps to
+an edge. Zeroing the LOD or bias selects mip zero. Zeroing the offset changes the
+lookup in mip one. Each mutated draw must match its own full CPU reference and
+first differ from the original reference at the predicted pixel and values.
+
+LLVM 15 assembles and disassembles the four forms and checks that the container
+CLI emits the same HLSL as the text path. The optional `compile` command runs
+DXC and computes the expected first differences on the CPU.
+
+```sh
+python3 -B tests/pixel_compare_lod_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+```powershell
+python -B tests/pixel_compare_lod_check.py compile level dxc
+python -B tests/pixel_compare_lod_check.py compile bias dxc
+ctest --preset dev --no-tests=error -j 1 -R '^pixel_aot_compare_lod_(level|bias)_(warp|hardware)$' -V
+```
+
+The Level tests require PS 6.7 and `AdvancedTextureOpsSupported`. The Bias tests
+require PS 6.8 and `SampleCmpGradientAndBiasSupported`. The renderer uses the
+Windows SDK 10.0.26100 headers for these capability queries. CTest reports an
+unsupported profile, SDK header set or device capability as a skip (77).
+Intel Arc B390 and WARP passed the Level tests. WARP passed the Bias tests.
+Arc B390 reported the Bias capability unavailable and skipped those tests.
+
 ### Desktop xmem.dll
 
 `src/xmem_shim.cpp` builds `xmem.dll`, which exports the four functions the package DLLs import by name. The call shapes come from the observed call sites, not from a published header:

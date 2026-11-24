@@ -4359,17 +4359,20 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             vector_loads += 1
             vector[dst] = f"alu{i}"
             sample_dest[dst] = vector_loads
-        elif m := match(r"(image_sample_c(?:_lz)?(?:_o)?) (v\d+), (?:v\[(\d+):(\d+)\]|\[(v\d+), (v\d+), (v\d+)\]), "
+        elif m := match(r"(image_sample_c(?:_lz|_l|_b)?(?:_o)?) (v\d+), (?:v\[(\d+):(\d+)\]|\[(v\d+), (v\d+), (v\d+)\]), "
                         r"s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x1 dim:SQ_RSRC_IMG_2D"):
-            # The optional packed offset precedes the reference, followed by the UV pair.
+            # RDNA 2 orders the address as offset, bias, reference, UV, explicit LOD.
+            # Only the reference and UV pair are present in every comparison form.
             op, dst, first, last, *nsa = m.groups()[:7]
             image = registers(*m.groups()[7:9], 8)
             state = registers(*m.groups()[9:11], 4)
             has_offset = op.endswith("_o")
-            explicit_zero = op.removesuffix("_o") == "image_sample_c_lz"
+            base_op = op.removesuffix("_o")
+            explicit_level = base_op in ("image_sample_c_lz", "image_sample_c_l")
+            has_level_operand = base_op in ("image_sample_c_l", "image_sample_c_b")
             if first is None and op != "image_sample_c_lz":
                 raise ValueError("Comparison sample requires a contiguous address")
-            address = ([f"v{n}" for n in registers(first, last, 3 + has_offset)]
+            address = ([f"v{n}" for n in registers(first, last, 3 + has_offset + has_level_operand)]
                        if first is not None else nsa)
             if any(int(reg[1:]) > 255 for reg in (dst, *address)):
                 raise ValueError("Comparison sample VGPR out of range")
@@ -4382,10 +4385,24 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or descriptor != [("tex", j) for j in range(8)]
                     or [scalar.get(f"s{n}") for n in state] != list(sampler)):
                 raise ValueError("Unsupported image or sampler binding")
-            if not explicit_zero and sampler[1] & 0xfff000:
+            if has_level_operand:
+                if sampler[1] & 0xfff000 != 0x100000 or (sampler[2] >> 26) & 3 != 1:
+                    raise ValueError("Comparison LOD/bias requires MAX_LOD 1 and point mip filtering")
+                if (sampler[2] >> 20) & 0xf:
+                    raise ValueError("Comparison LOD/bias requires point XY filtering")
+            elif not explicit_level and sampler[1] & 0xfff000:
                 raise ValueError("Implicit comparison sampling requires MAX_LOD 0")
             offset_arg = sample_offset_arg(address.pop(0), vector, sample_dest, known_ssa_bits) if has_offset else ""
-            if not explicit_zero and any(vector.get(reg) not in quad_values for reg in address[1:]):
+            level_arg = ""
+            if has_level_operand:
+                operand = address.pop() if explicit_level else address.pop(0)
+                if operand in sample_dest:
+                    raise ValueError("Comparison LOD operand used before vmcnt wait")
+                value = vector.get(operand)
+                if not isinstance(value, str) or known_ssa_bits.get(value) not in (0, 0x3f800000):
+                    raise ValueError("Comparison LOD or bias must be statically 0 or 1")
+                level_arg = f", {value}"
+            if not explicit_level and any(vector.get(reg) not in quad_values for reg in address[1:]):
                 raise ValueError("Implicit comparison sampling requires coordinates with quad provenance")
             if sample_kind is None:
                 lines[lines.index(SAMPLED_RESOURCES)] = comparison_resources(comparison_sampler_state(sampler))
@@ -4398,8 +4415,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 if not isinstance(value, str) or not (value in quad_values or value.startswith(("sample", "alu", "params"))):
                     raise ValueError("Unsupported comparison sample operand")
             reference, u, v = values
-            method = "SampleCmpLevelZero" if explicit_zero else "SampleCmp"
-            lines.append(f"    float sample{i} = tex.{method}(samp, float2({u}, {v}), {reference}{offset_arg});")
+            method = {"image_sample_c_lz": "SampleCmpLevelZero", "image_sample_c_l": "SampleCmpLevel",
+                      "image_sample_c_b": "SampleCmpBias", "image_sample_c": "SampleCmp"}[base_op]
+            lines.append(f"    float sample{i} = tex.{method}(samp, float2({u}, {v}), "
+                         f"{reference}{level_arg}{offset_arg});")
             samples += 1
             vector_loads += 1
             vector[dst] = f"sample{i}"
