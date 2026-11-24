@@ -3388,7 +3388,7 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_mimg_store_(packed_)?
 The compute store profile lowers one unguarded 32-bit `image_atomic_*`
 instruction per `gfx1030` shader, with `glc` clear, one 32-bit data VGPR,
 a contiguous pair of 32-bit X/Y coordinate VGPRs, and optional `unorm`.
-The caller supplies in-bounds coordinates and declares a scalar `R32_UINT`
+The caller supplies in-bounds coordinates and declares a scalar integer
 2D image with identity channel selectors and binds its matching UAV to
 `u0` at mip 0. The eight resource words must be loaded from the declared table
 offset and ready at issue. The translator tracks the descriptor's provenance.
@@ -3401,20 +3401,27 @@ this profile. See sections 8.2 and 12.16 of the
 |---|---|
 | `add`, `sub` | `InterlockedAdd`, `R32_UINT`, negate the subtract operand modulo 2^32 |
 | `and`, `or`, `xor` | Matching `Interlocked` bitwise intrinsic, `R32_UINT` |
+| `smin`, `smax` | Signed `InterlockedMin` or `InterlockedMax`, `R32_SINT`, reinterpret the operand with `asint` |
+| `umin`, `umax` | Unsigned `InterlockedMin` or `InterlockedMax`, `R32_UINT` |
 
 `DMASK` is `0x1`. The
 [format support query](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_format_support2)
 gates the typed atomic operations for each view. An unavailable capability
-returns 77. The GPU fixture compares 336 words over all three mips of a
+returns 77. Min/max has its own suite and checks the signed or unsigned
+min/max capability for each dispatch; it does not gate arithmetic or bitwise
+tests. The GPU fixture compares 336 words over all three mips of a
 32x8 texture per case, including untouched words. One- and two-group draws
 exercise high-bit inputs, arithmetic wraparound and two lanes adding to
 each texel in the contended add case. Lowering subtract as add must fail
-first at mip 0, word 32. The test records the five forms only after all
-positive and negative dispatch checks complete.
+first at mip 0, word 32. The min/max fixture checks both same-sign and
+opposite-sign pairs with an independent CPU comparison. For each form,
+switching the comparison's signedness and binding the matching UAV must fail
+first at mip 0, word 33. Only a complete suite records coverage. Returning
+atomics, exchange, compare-exchange, counters and float atomics are not lowered.
 
 The LLVM 15 test assembles, disassembles and translates the cases through the
-synthetic-container CLI. The standalone compile mode checks the generated
-`cs_6_0` shaders and the subtract mutation without adapter access. The GPU
+synthetic-container CLI. The standalone compile modes check the generated
+`cs_6_0` shaders and their mutations without adapter access. The GPU
 tests are the translated DXIL comparison against the CPU reference. Run these
 serially after coordinating adapter access.
 
@@ -3423,8 +3430,9 @@ $Dxc = (Get-Command dxc -ErrorAction Stop).Source
 $env:TMP = (Resolve-Path out).Path
 $env:TEMP = $env:TMP
 python -B tests/compute_store_check.py compile-mimg-atomic-integer $Dxc
+python -B tests/compute_store_check.py compile-mimg-atomic-minmax $Dxc
 cmake --build --preset dev --target offscreen_check
-ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_mimg_atomic_integer_(warp|hardware)$' -V
+ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_mimg_atomic_(integer|minmax)_(warp|hardware)$' -V
 ```
 
 ```bash

@@ -99,7 +99,8 @@ MUBUF_ATOMIC_METHODS = {
     "swap": "Exchange", "cmpswap": "CompareExchange",
 }
 
-IMAGE_ATOMIC_OPS = "add|sub|and|or|xor"
+IMAGE_ATOMIC_OPS = "add|sub|and|or|xor|smin|smax|umin|umax"
+IMAGE_ATOMIC_TYPES = {"R32_UINT": "uint", "R32_SINT": "int"}
 
 
 def checked_group(group):
@@ -212,7 +213,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     the caller's statement of the image format inside it. The image binds to t0 for loads or u0
     for writes, where image_uav_mip selects the writable subresource and replaces descriptor_offset.
     R32_UINT selects the 4-sample Texture2DMS profile for an SRV or the
-    non-returning 2D integer atomic profile for a UAV.
+    non-returning 2D integer atomic profile for a UAV. R32_SINT is UAV-only
+    and selects signed min/max.
     """
     dims = checked_group(group)
     if cpu not in ("gfx1013", "gfx1030"):
@@ -224,11 +226,11 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     image_msaa = not image_output and image_format == "R32_UINT"
     if image_msaa and cpu != "gfx1030":
         raise ValueError("The R32_UINT MSAA image binding requires gfx1030")
-    image_atomic = image_output and image_format == "R32_UINT"
+    image_atomic_type = IMAGE_ATOMIC_TYPES.get(image_format) if image_output else None
     if image_output:
         if (cpu != "gfx1030" or descriptor_offset is not None or stride is not None
-                or image_descriptor is None or (image_format not in IMAGE_FORMATS and not image_atomic)
-                or (image_atomic and image_uav_mip != 0)
+                or image_descriptor is None or (image_format not in IMAGE_FORMATS and not image_atomic_type)
+                or (image_atomic_type and image_uav_mip != 0)
                 or not 0 <= image_uav_mip <= 15):
             raise ValueError("Invalid image UAV binding")
         descriptor_bindings = {}
@@ -255,7 +257,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         raise ValueError("Unsupported formatted source binding")
     if image_descriptor is not None or image_format is not None:
         # The 8-dword image descriptor occupies two 16-byte slots.
-        if (not (image_format in IMAGE_FORMATS or image_msaa or image_atomic)
+        if (not (image_format in IMAGE_FORMATS or image_msaa or image_atomic_type)
                 or image_descriptor is None or source_descriptor is not None
                 or not 0 <= image_descriptor < 1 << 20 or image_descriptor % 4
                 or any(image_descriptor + half in descriptor_bindings for half in (0, 16))
@@ -1229,7 +1231,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                r"v\[(?P<x>\d+):(?P<y>\d+)\], s\[(?P<base>\d+):(?P<high>\d+)\] "
                                r"dmask:0x(?P<mask>[0-9a-f]+) dim:SQ_RSRC_IMG_2D(?: unorm)?", line):
             op = m["op"]
-            if not image_atomic or guard_span is not None or stores:
+            signed = op in ("smin", "smax")
+            if image_atomic_type != ("int" if signed else "uint") or guard_span is not None or stores:
                 raise ValueError("Unsupported image atomic target or binding")
             data = int(m["data"])
             if int(m["mask"], 16) != 1 or data > 255:
@@ -1250,6 +1253,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             value = hlsl_word(source)
             if op == "sub":
                 value = f"(0u - {value})"
+            elif signed:
+                value = f"asint({value})"
             stores.append(f"    Interlocked{MUBUF_ATOMIC_METHODS[op]}({destination}, {value});")
         elif m := re.fullmatch(r"image_(?P<kind>load|store|get_resinfo)(?P<mip>_mip)?(?P<packed>_pck(?:_sgn)?)? "
                                r"(?P<data>v\d+|v\[\d+:\d+\]), (?P<addr>v\d+|v\[\d+:\d+\]), "
@@ -1535,7 +1540,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             local = ", uint3 local : SV_GroupThreadID"
     # Helpers are selected from the final body, so a float ALU result used only by a DS step still gets its definition.
     cbuffer += "".join(text for name, text in F32_HELPERS.items() if f"f32_{name}(" in body)
-    uav = f"RWTexture2D<{'uint' if image_atomic else 'uint4'}>" if image_output else "RWByteAddressBuffer"
+    uav = f"RWTexture2D<{image_atomic_type or 'uint4'}>" if image_output else "RWByteAddressBuffer"
     return (f"{cbuffer}{uav} outputData : register(u0);\n[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
             f"void main(uint3 tid : SV_DispatchThreadID{local}) {{\n{body}\n}}\n")
 
@@ -1569,8 +1574,9 @@ def main():
                         help="Table byte offset of the 8-dword image descriptor bound to t0 or u0")
     parser.add_argument("--image-uav-mip", type=int,
                         help="Bind the image to u0 at this mip instead of binding a raw output descriptor")
-    parser.add_argument("--image-format", choices=sorted(IMAGE_FORMATS.keys() | {"R32_UINT"}),
-                        help="Caller-declared image format (R32_UINT selects MSAA for an SRV or atomics for a UAV)")
+    parser.add_argument("--image-format", choices=sorted(IMAGE_FORMATS.keys() | IMAGE_ATOMIC_TYPES.keys()),
+                        help="Caller-declared image format (R32_UINT for MSAA SRVs or atomic UAVs, "
+                             "R32_SINT for signed min/max UAVs)")
     args = parser.parse_args()
     if (args.descriptor_offset is None) == (args.image_uav_mip is None):
         parser.error("Choose either --descriptor-offset or --image-uav-mip")

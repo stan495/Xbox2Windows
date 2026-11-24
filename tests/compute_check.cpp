@@ -26,7 +26,11 @@ constexpr UINT uavs = 13, srvs = 21;
 // carries raw texels, one word each for RGBA8 and scalar R32, or four for RGBA32.
 constexpr UINT texture_rgba8_flag = 1u << 24;
 constexpr UINT texture_atomic_uint_flag = 1u << 25;
-constexpr UINT texture_format_mask = texture_rgba8_flag | texture_atomic_uint_flag;
+constexpr UINT texture_atomic_sint_minmax_flag = 1u << 26;
+constexpr UINT texture_atomic_uint_minmax_flag = 1u << 27;
+constexpr UINT texture_atomic_mask = texture_atomic_uint_flag | texture_atomic_sint_minmax_flag |
+                                     texture_atomic_uint_minmax_flag;
+constexpr UINT texture_format_mask = texture_rgba8_flag | texture_atomic_mask;
 constexpr UINT texture_width = 32, texture_height = 8, texture_channels = 4;
 constexpr UINT texture_mip_levels = 3;
 }
@@ -424,6 +428,14 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
         required = D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD |
                    D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS;
         break;
+    case texture_atomic_sint_minmax_flag:
+        format = DXGI_FORMAT_R32_SINT;
+        required = D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX;
+        break;
+    case texture_atomic_uint_minmax_flag:
+        format = DXGI_FORMAT_R32_UINT;
+        required = D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX;
+        break;
     default: throw std::runtime_error("Invalid compute image store format selector");
     }
     const UINT words_per_texel = selector ? 1 : texture_channels;
@@ -433,7 +445,7 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     source.read(reinterpret_cast<char*>(initial.data()), all_words * sizeof(UINT));
     source.read(reinterpret_cast<char*>(expected.data()), all_words * sizeof(UINT));
     if (!source || source.peek() != std::char_traits<char>::eof() || !groups || groups > 2 || mip >= texture_mip_levels
-        || (selector == texture_atomic_uint_flag && mip != 0))
+        || ((selector & texture_atomic_mask) && mip != 0))
         throw std::runtime_error("Invalid compute image store reference");
 
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};

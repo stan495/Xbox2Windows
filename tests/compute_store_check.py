@@ -3331,10 +3331,12 @@ def binary(directory, assembler, objcopy, library):
     gfx1030_binary(directory, assembler, objcopy, library,
                    [(name, lines, MIMG_BINDING) for name, _, _, _, _, lines in mimg_resinfo_cases()],
                    "image_get_resinfo", group=(8, 8, 1))
-    mimg_atomic_controls()
-    gfx1030_binary(directory, assembler, objcopy, library,
-                   [(f"image_atomic_{name}", lines, binding) for name, _, lines, binding in mimg_atomic_cases()],
-                   "image_atomic_", group=MIMG_STORE_GROUP)
+    for minmax in (False, True):
+        mimg_atomic_controls(minmax=minmax)
+        gfx1030_binary(directory, assembler, objcopy, library,
+                       [(f"image_atomic_{name}", lines, binding)
+                        for name, _, lines, binding in mimg_atomic_cases(minmax=minmax)],
+                       "image_atomic_", group=MIMG_STORE_GROUP)
     mimg_store_controls()
     gfx1030_binary(directory, assembler, objcopy, library,
                    [(name, lines, binding) for name, _, _, lines, binding in mimg_store_cases()],
@@ -4800,13 +4802,16 @@ def mimg_resinfo_draw(directory, compiler, renderer, backend):
 
 
 MIMG_ATOMIC_UINT_FLAG = 1 << 25
+MIMG_ATOMIC_MINMAX_FLAGS = {"s": 1 << 26, "u": 1 << 27}
+MIMG_ATOMIC_MINMAX_OPS = ("smin", "smax", "umin", "umax")
 MIMG_ATOMIC_BEFORE = (0xfffffff0, 0x7ffffff0, 0x20, 0x80000000)
 MIMG_ATOMIC_VALUE = 0x80000011
 
 
-def mimg_atomic_cases():
-    binding = MIMG_STORE_BINDING | {"image_uav_mip": 0, "image_format": "R32_UINT"}
-    for op in ("add", "sub", "and", "or", "xor"):
+def mimg_atomic_cases(*, minmax=False):
+    for op in MIMG_ATOMIC_MINMAX_OPS if minmax else ("add", "sub", "and", "or", "xor"):
+        image_format = "R32_SINT" if op in ("smin", "smax") else "R32_UINT"
+        binding = MIMG_STORE_BINDING | {"image_uav_mip": 0, "image_format": image_format}
         for contended in ((False, True) if op == "add" else (False,)):
             lines = ["s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
                      "s_load_dwordx8 s[24:31], s[12:13], 0x40",
@@ -4822,9 +4827,10 @@ def mimg_atomic_cases():
             yield op + ("_contended" if contended else ""), contended, lines, binding
 
 
-def mimg_atomic_controls():
-    cases = {op: (lines, binding) for op, _, lines, binding in mimg_atomic_cases()}
-    lines, binding = cases["add"]
+def mimg_atomic_controls(*, minmax=False):
+    cases = {op: (lines, binding) for op, _, lines, binding in mimg_atomic_cases(minmax=minmax)}
+    base_op = "smin" if minmax else "add"
+    lines, binding = cases[base_op]
     instruction = lines[-3]
     for changed, diagnostic in (
         (instruction.replace("dmask:0x1", "dmask:0xf"), "Unverified image atomic data range or mask"),
@@ -4849,25 +4855,34 @@ def mimg_atomic_controls():
     rejects("Invalid image UAV binding", aot.lower, lines, MIMG_STORE_GROUP,
             **(binding | {"image_uav_mip": 1}))
     srv_binding = {key: value for key, value in binding.items() if key != "image_uav_mip"}
-    rejects("Unsupported image atomic target or binding", aot.lower, lines, MIMG_STORE_GROUP,
+    rejects("Invalid or overlapping image descriptor binding" if minmax else "Unsupported image atomic target or binding",
+            aot.lower, lines, MIMG_STORE_GROUP,
             **(srv_binding | {"descriptor_offset": MIMG_BINDING["descriptor_offset"]}))
     msaa = "image_msaa_load v[14:17], v[8:10], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D_MSAA unorm"
     rejects("requires an unguarded R32_UINT MSAA binding", aot.lower,
             variant(lines, (instruction, msaa)), MIMG_STORE_GROUP, **binding)
     rejects("Invalid image UAV binding", aot.lower, lines, MIMG_STORE_GROUP, **(binding | {"cpu": "gfx1013"}))
-    rejects("Invalid image UAV binding", aot.lower, lines, MIMG_STORE_GROUP,
-            **(binding | {"image_format": "R32_SINT"}))
-    for op in ("swap", "cmpswap", "smin", "smax", "umin", "umax", "inc", "dec", "fcmpswap", "fmin", "fmax"):
+    for case, case_binding in cases.values():
+        wrong_format = "R32_UINT" if case_binding["image_format"] == "R32_SINT" else "R32_SINT"
+        rejects("Unsupported image atomic target or binding", aot.lower, case, MIMG_STORE_GROUP,
+                **(case_binding | {"image_format": wrong_format}))
+    for op in ("swap", "cmpswap", "inc", "dec", "fcmpswap", "fmin", "fmax"):
         rejects("Unsupported compute instruction", aot.lower,
-                variant(lines, ("image_atomic_add", "image_atomic_" + op)), MIMG_STORE_GROUP, **binding)
+                variant(lines, ("image_atomic_" + base_op, "image_atomic_" + op)), MIMG_STORE_GROUP, **binding)
     rejects("Unsupported image store target", aot.lower,
-            variant(lines, ("image_atomic_add", "image_store")), MIMG_STORE_GROUP, **binding)
+            variant(lines, ("image_atomic_" + base_op, "image_store")), MIMG_STORE_GROUP, **binding)
 
 
 def mimg_atomic_reference(op, contended, groups):
     value = MIMG_ATOMIC_VALUE
-    update = {"add": lambda old: old + value, "sub": lambda old: old - value,
-              "and": lambda old: old & value, "or": lambda old: old | value, "xor": lambda old: old ^ value}[op]
+    if op in MIMG_ATOMIC_MINMAX_OPS:
+        # Flipping the sign bit maps two's-complement order to unsigned order.
+        key = (lambda word: word ^ 0x80000000) if op[0] == "s" else None
+        choose = min if op[1:] == "min" else max
+        update = lambda old: choose(old, value, key=key)
+    else:
+        update = {"add": lambda old: old + value, "sub": lambda old: old - value,
+                  "and": lambda old: old & value, "or": lambda old: old | value, "xor": lambda old: old ^ value}[op]
     initial, expected = [], []
     for level in range(3):
         for y in range(TEXTURE_HEIGHT >> level):
@@ -4884,42 +4899,68 @@ def mimg_atomic_reference(op, contended, groups):
     return initial, expected
 
 
-def mimg_atomic_integer(directory, compiler, renderer=None, backend=None):
-    mimg_atomic_controls()
+def mimg_atomic_integer(directory, compiler, renderer=None, backend=None, *, minmax=False):
+    mimg_atomic_controls(minmax=minmax)
     record_path = os.environ.get("FORM_COVERAGE_RECORD") if renderer else None
     record = Path(record_path) if record_path else None
     if record:
         record.unlink(missing_ok=True)
     completed = set()
-    for name, contended, lines, binding in mimg_atomic_cases():
+    for name, contended, lines, binding in mimg_atomic_cases(minmax=minmax):
         src, cso, case = (directory / f"image_atomic_{name}.{ext}" for ext in ("hlsl", "cso", "case"))
         code = aot.lower(lines, MIMG_STORE_GROUP, **binding)
         src.write_text(code, encoding="ascii")
         compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
         subprocess.run(compile_shader, check=True)
         op = name.removesuffix("_contended")
+        flag = MIMG_ATOMIC_MINMAX_FLAGS[op[0]] if minmax else MIMG_ATOMIC_UINT_FLAG
         for groups in (1, 2):
             initial, expected = mimg_atomic_reference(op, contended, groups)
             assert len(initial) == len(expected) == 336 and initial != expected
             if renderer:
-                dispatch = groups | MIMG_ATOMIC_UINT_FLAG
+                dispatch = groups | flag
                 case.write_bytes(struct.pack("<674I", dispatch, 0, *initial, *expected))
                 run = [renderer, backend, "--compute-texture-store-case", cso, case]
                 print(f"image_atomic_{name} groups={groups}", flush=True)
                 result = subprocess.run(run)
                 if result.returncode:
                     return result.returncode
+        mutant = None
         if op == "sub":
             correct, wrong = f"(0u - {MIMG_ATOMIC_VALUE:#010x}u)", f"{MIMG_ATOMIC_VALUE:#010x}u"
             mismatch = "mip=0 word=32 expected=7fffffdf actual=80000001"
+            control = "wrong atomic operand"
             assert code.count(correct) == 1
-            src.write_text(code.replace(correct, wrong), encoding="ascii")
+            mutant = code.replace(correct, wrong)
+        elif minmax:
+            signed = op[0] == "s"
+            other = "u" if signed else "s"
+            decl, wrong_decl = ("int", "uint") if signed else ("uint", "int")
+            value = f"{MIMG_ATOMIC_VALUE:#010x}u"
+            correct, wrong = (f"asint({value})", value) if signed else (value, f"asint({value})")
+            assert code.count(f"RWTexture2D<{decl}>") == code.count(f", {correct});") == 1
+            mutant = code.replace(f"RWTexture2D<{decl}>", f"RWTexture2D<{wrong_decl}>").replace(
+                f", {correct});", f", {wrong});")
+            _, wrong_expected = mimg_atomic_reference(other + op[1:], contended, groups)
+            first = next(i for i, (a, b) in enumerate(zip(expected, wrong_expected, strict=True)) if a != b)
+            assert first == TEXTURE_WIDTH + 1
+            mismatch = f"mip=0 word={first} expected={expected[first]:08x} actual={wrong_expected[first]:08x}"
+            control = "wrong atomic signedness"
+            if renderer:
+                dispatch = groups | MIMG_ATOMIC_MINMAX_FLAGS[other]
+                case.write_bytes(struct.pack("<674I", dispatch, 0, *initial, *expected))
+        if mutant is not None:
+            src.write_text(mutant, encoding="ascii")
             subprocess.run(compile_shader, check=True)
             if renderer:
                 bad = subprocess.run(run, capture_output=True, text=True)
+                if minmax and bad.returncode == 77:
+                    print(bad.stdout, end="")
+                    print(bad.stderr, end="", file=sys.stderr)
+                    return 77
                 if bad.returncode != 1 or mismatch not in bad.stderr:
-                    raise AssertionError(f"{name}: wrong atomic operand escaped detection\n{bad.stderr}")
-                print(f"{name} wrong atomic operand: {bad.stderr}", end="")
+                    raise AssertionError(f"{name}: {control} escaped detection\n{bad.stderr}")
+                print(f"{name} {control}: {bad.stderr}", end="")
         completed.add(f"image_atomic_{op}")
     if record:
         record.parent.mkdir(parents=True, exist_ok=True)
@@ -5606,6 +5647,8 @@ if __name__ == "__main__":
                  "draw-mimg-store": mimg_store_draw,
                  "compile-mimg-atomic-integer": lambda d, compiler: mimg_atomic_integer(d, compiler),
                  "draw-mimg-atomic-integer": mimg_atomic_integer,
+                 "compile-mimg-atomic-minmax": lambda d, compiler: mimg_atomic_integer(d, compiler, minmax=True),
+                 "draw-mimg-atomic-minmax": lambda d, *a: mimg_atomic_integer(d, *a, minmax=True),
                  "draw-mimg-packed-store": lambda d, *a: mimg_store_draw(d, *a, packed=True),
                  "draw-ds-route": ds_draw,
                  "draw-lds-qword": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_QWORD_CASES),
