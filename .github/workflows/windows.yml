@@ -69,6 +69,7 @@ jobs:
               (["tests/pixel_sample_offset_check.py", *COMMON_LLVM], {}),
               (["tests/pixel_compare_lod_check.py", *COMMON_LLVM], {}),
               (["tests/pixel_compare_grad_check.py", *COMMON_LLVM, "llc-15"], {}),
+              (["tests/pixel_compare_grad_check.py", "binary-coarse", *COMMON_LLVM[1:], "llc-15"], {}),
               (["tests/pixel_compare_grad_check.py", "glsl", "glslangValidator", "spirv-val", "spirv-dis"], {}),
               (["tests/pixel_compare_sample_check.py", *COMMON_LLVM], {}),
               (["tests/pixel_compare_check.py", *COMMON_LLVM], {}),

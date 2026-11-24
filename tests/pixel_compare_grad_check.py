@@ -1,4 +1,4 @@
-"""Check gfx1030 2D depth comparisons with explicit FP32 or G16 gradients."""
+"""Check gfx1030 2D depth comparisons with explicit or uniform coarse FP32 or G16 gradients."""
 import os
 from pathlib import Path
 import re
@@ -8,8 +8,8 @@ import sys
 import tempfile
 
 from compute_store_check import assemble
-from pixel_aot_check import envelope, write_record
-from pixel_compare_check import pixel_aot, prefix, sampler_moves, sampler_words, tail, translate
+from pixel_aot_check import envelope, lower as recorded_lower, write_record
+from pixel_compare_check import pixel_aot, prefix, sampler_moves, sampler_words, tail
 from pixel_compare_lod_check import (
     OFFSET, first_mismatch, probe_shader_profile, reference_rows, run_draw, sampler, write_case,
 )
@@ -17,12 +17,14 @@ from pixel_compare_sample_check import must_reject
 from pixel_sample_gradient_check import WAVE64
 
 
-FORMS = {
+EXPLICIT = {
     "image_sample_c_d": 3,
     "image_sample_c_d_o": 2,
     "image_sample_c_d_g16": 5,
     "image_sample_c_d_o_g16": 4,
 }
+COARSE = {op.replace("_c_d", "_c_cd"): first for op, first in EXPLICIT.items()}
+FORMS = EXPLICIT | COARSE
 DISTINCT = (0.125, -0.25, 0.5, 1.0)
 ZERO = (0.0, 0.0, 0.0, 0.0)
 DRAWS = ((8, (0.0, -0.25, 0.0, 0.0)), (16, (0.0, 0.0, 0.25, 0.0)))
@@ -57,18 +59,26 @@ def program(op, slopes, *, scale=1, packed="0x3e01", compare="s60", words=None):
             *tail(reference=f"v{reference}")]
 
 
-def controls():
-    def lower(lines, words):
-        return pixel_aot.lower(lines, 20, 24, words, constant_descriptor=64)
+def translate(lines, words):
+    return recorded_lower(lines, 20, 24, words, constant_descriptor=64, cpu="gfx1030")
+
+
+def controls(forms):
+    def lower(lines, words, cpu="gfx1030"):
+        return pixel_aot.lower(lines, 20, 24, words, constant_descriptor=64, cpu=cpu)
 
     words = sampler()
-    for op, first in FORMS.items():
+    for op, first in forms.items():
         lines = program(op, DISTINCT)
         hlsl = lower(lines, words)
         assert "tex.SampleCmpGrad(samp, float2(uv.x, uv.y)," in hlsl, op
         assert (", int2(1, -2))" in hlsl) == has_offset(op), op
         assert ("widen16(asuint(" in next(line for line in hlsl.splitlines()
                                          if "tex.SampleCmpGrad(" in line)) == op.endswith("_g16"), op
+        if op in COARSE:
+            must_reject(lambda: lower(lines, words, cpu="gfx1013"), "require gfx1030")
+            clamp = op.replace("_c_cd", "_c_cd_cl")
+            must_reject(lambda: lower([line.replace(op, clamp) for line in lines], words), "Unsupported instruction")
         nsa = "[" + ", ".join(f"v{reg}" for reg in range(first, 10)) + "]"
         for old, new, diagnostic in (
             (f"v[{first}:9]", f"v[{first}:8]", "Descriptor or vector width mismatch"),
@@ -94,6 +104,11 @@ def controls():
             bad = [f"v_mov_b32_e32 v{grad}, {value}" if line.startswith(f"v_mov_b32_e32 v{grad},") else line
                    for line in lines]
             must_reject(lambda: lower(bad, words), diagnostic)
+        if op in COARSE:
+            lane_slopes = program(op, DISTINCT, scale=2)
+            lane_slopes = [f"v_add_f32_e32 v{grad}, v8, v8" if line.startswith(f"v_mov_b32_e32 v{grad},") else line
+                           for line in lane_slopes]
+            must_reject(lambda: lower(lane_slopes, words), "must be statically known")
         image = next(i for i, line in enumerate(lines) if line.startswith(f"{op} "))
         lines.insert(image, f"image_sample_c_lz v{grad}, v[7:9], s[28:35], s[40:43] dmask:0x1 dim:SQ_RSRC_IMG_2D")
         # Copy the ready comparison reference to the address of the first sample.
@@ -107,7 +122,8 @@ def check_llvm_codegen(directory, llc, op):
     g16 = op.endswith("_g16")
     suffix = ".o" if has_offset(op) else ""
     precision = "f16" if g16 else "f32"
-    intrinsic = f"llvm.amdgcn.image.sample.c.d{suffix}.2d.f32.{precision}.f32"
+    gradient = "cd" if op in COARSE else "d"
+    intrinsic = f"llvm.amdgcn.image.sample.c.{gradient}{suffix}.2d.f32.{precision}.f32"
     slope_type = "half" if g16 else "float"
     offset_decl = "i32, " if has_offset(op) else ""
     offset_arg = "i32 15873, " if has_offset(op) else ""
@@ -140,9 +156,9 @@ def check_llvm_codegen(directory, llc, op):
         assert actual == bits, (reg, bits, actual, asm)
 
 
-def check_binary(directory, assembler, objcopy, library, llc):
+def check_binary(directory, assembler, objcopy, library, llc, *, forms):
     words = sampler()
-    for op, first in FORMS.items():
+    for op, first in forms.items():
         check_llvm_codegen(directory, llc, op)
         lines = program(op, DISTINCT)
         # LLVM MC uses an eight-VGPR tuple for the six/seven-word encoding.
@@ -212,10 +228,10 @@ def whole_mip(slopes):
     return {0: 0, 4: 1}[max(squared)]
 
 
-def check_shader(directory, compiler, renderer=None, adapter=None):
+def check_shader(directory, compiler, renderer=None, adapter=None, *, forms):
     args = probe_shader_profile(directory, compiler, "ps_6_8")
     source, shader, case, mutation = (directory / name for name in ("grad.hlsl", "grad.cso", "grad.case", "mutation.case"))
-    for op in FORMS:
+    for op in forms:
         check_dxil_order(directory, args, op)
         displacement = OFFSET if has_offset(op) else (0, 0)
         for size, slopes in DRAWS:
@@ -246,11 +262,17 @@ def check_shader(directory, compiler, renderer=None, adapter=None):
 
 
 if __name__ == "__main__":
-    controls()
-    if len(sys.argv) > 1:
+    mode = sys.argv[1] if len(sys.argv) > 1 else "controls"
+    forms = COARSE if mode.endswith("-coarse") else EXPLICIT
+    mode = mode.removesuffix("-coarse")
+    controls(forms)
+    if mode != "controls":
         out = Path(__file__).resolve().parents[1] / "out"
         out.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="compare-grad-", dir=out) as directory:
-            {"binary": check_binary, "compile": check_shader, "draw": check_shader, "glsl": check_glsl}[sys.argv[1]](
-                Path(directory), *sys.argv[2:])
+            if mode == "glsl":
+                check_glsl(Path(directory), *sys.argv[2:])
+            else:
+                {"binary": check_binary, "compile": check_shader, "draw": check_shader}[mode](
+                    Path(directory), *sys.argv[2:], forms=forms)
     print("gfx1030 depth-comparison gradient checks passed")

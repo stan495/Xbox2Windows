@@ -9162,6 +9162,26 @@ capability skip (77). WARP passed readback for all four forms. Intel Arc B390
 reported the comparison gradient capability unavailable and skipped the test.
 Physical GPU readback requires an adapter that reports this capability.
 
+`image_sample_c_cd`, `image_sample_c_cd_o`, `image_sample_c_cd_g16`, and
+`image_sample_c_cd_o_g16` use the same address layout and comparison sampler.
+The coarse forms require gfx1030 and statically known normal or zero slopes.
+Each lane supplies the same gradient, so any lane selected by coarse sampling
+supplies the same pair to `SampleCmpGrad`. Dynamic slopes and instruction
+LOD clamp forms are refused. Native selection for varying slopes is unmeasured.
+The coarse fixtures use the same CPU reference and mutations and write separate
+coverage records for the coarse comparison forms.
+WARP passed the four coarse comparison forms. Arc B390 skipped the hardware
+fixture because it did not report the required comparison gradient capability.
+
+```sh
+python3 -B tests/pixel_compare_grad_check.py binary-coarse llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1 llc-15
+```
+
+```powershell
+python -B tests/pixel_compare_grad_check.py compile-coarse dxc
+ctest --preset dev --no-tests=error -j 1 -R '^pixel_aot_compare_coarse_grad_(warp|hardware)$' -V
+```
+
 ### Desktop xmem.dll
 
 `src/xmem_shim.cpp` builds `xmem.dll`, which exports the four functions the package DLLs import by name. The call shapes come from the observed call sites, not from a published header:
