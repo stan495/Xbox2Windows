@@ -236,12 +236,14 @@ float4 gather_2d(float2 uv, int2 offset, int mip, uint component) {
 }"""
 
 
-def check_gather_sampler(words, mips):
+def check_gather_sampler(words, mips, *, comparison):
     # SQ_IMG_SAMP_WORD0: clamp to last texel in X/Y, normalized coordinates, no truncation.
     # WORD1: zero MIN_LOD, MAX_LOD at or above the last visible mip. WORD2: bilinear XY,
     # point mip, zero biases. Keep the other fields zero in this profile.
     w0, w1, w2, w3 = words
-    if (w0 != 0x12 or w1 & ~0x00fff000 or (w1 >> 12) < ((mips - 1) << 8)
+    compare_mask = 0x7000 if comparison else 0
+    if ((w0 & ~compare_mask) != 0x12
+            or w1 & ~0x00fff000 or (w1 >> 12) < ((mips - 1) << 8)
             or w2 != 0x04500000 or w3 != 0):
         raise ValueError("Unsupported gather sampler: requires normalized clamp, bilinear XY, point mip and no LOD modifiers")
 
@@ -256,6 +258,21 @@ def gather_offset(bits):
 # SQ_TEX_DEPTH_COMPARE values (sampler word 0, bits 14:12). D3D12_COMPARISON_FUNC is the same order plus one.
 # The hardware compares the reference against the texel: the result is (reference OP texel).
 DEPTH_COMPARE = ("NEVER", "LESS", "EQUAL", "LESS_EQUAL", "GREATER", "NOT_EQUAL", "GREATER_EQUAL", "ALWAYS")
+
+
+def gather_compare_resources(compare):
+    if compare in (0, 7):
+        result = "0.0f" if compare == 0 else "1.0f"
+    else:
+        op = (None, "<", "==", "<=", ">", "!=", ">=", None)[compare]
+        result = f"float4(reference.xxxx {op} taps)"
+    return GATHER_RESOURCES + f"""
+float4 gather_compare(float2 uv, int2 offset, int mip, float reference) {{
+    float4 taps = gather_2d(uv, offset, mip, 0);
+    return {result};
+}}"""
+
+
 # D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT and D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT.
 COMPARISON_FILTERS = {0: ("point", 0x80), 1: ("bilinear", 0x94)}
 
@@ -2893,7 +2910,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     """Track descriptor provenance, interpolation and packed or uncompressed exports.
 
     texture_offset is the aligned byte offset of t0 in the texture descriptor table.
-    gather_mips declares the number of visible mips in matching gfx1030 and desktop float4 2D views.
+    gather_mips declares the number of visible mips in matching gfx1030 and desktop 2D views.
+    For comparison gather the selected red texel values and the reference must be in [0, 1].
     Gather coordinates must map to the same half-texel lattice on both views (see experiments.md).
     constant_descriptor is the byte offset, on the texture table, of the descriptor mapped to b0.
     Each extra_constants entry is an (entry SGPR, byte offset) pair naming one further 16-byte
@@ -2925,8 +2943,6 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         if (cpu != "gfx1030" or sampler is None or second_texture_offset is not None or integer_export
                 or type(gather_mips) is not int or not 1 <= gather_mips <= 16):
             raise ValueError("Gather requires a gfx1030 float pixel profile with one texture and 1 to 16 visible mips")
-        if len(sampler) == 4:
-            check_gather_sampler(sampler, gather_mips)
     if title_ranges is not None and (isinstance(title_ranges, bool) or not isinstance(title_ranges, int)
                                      or not 1 <= title_ranges <= 0xffffffff):
         raise ValueError("Invalid title range count")
@@ -4261,19 +4277,22 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             vector_loads += 1
             vector[dst] = f"sample{i}"
             sample_dest[dst] = vector_loads
-        elif m := match(r"image_gather4(?P<lod>_lz|_l)?(?P<offset>_o)? v\[(\d+):(\d+)\], v\[(\d+):(\d+)\], "
+        elif m := match(r"image_gather4(_c)?(_lz|_l)?(_o)? v\[(\d+):(\d+)\], v\[(\d+):(\d+)\], "
                         r"s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x([0-9a-f]+) dim:SQ_RSRC_IMG_2D"):
-            lod_mode, offset_mode, dst_first, dst_last, addr_first, addr_last, image_first, image_last, \
+            comparison, lod_mode, offset_mode, dst_first, dst_last, addr_first, addr_last, image_first, image_last, \
                 sampler_first, sampler_last, dmask = m.groups()
             if gather_mips is None or mask != "entry" or region is not None or sample_kind is not None:
                 raise ValueError("Gather requires one unguarded instruction and a declared gather view")
             if lod_mode is None and gather_mips != 1:
                 raise ValueError("Implicit gather requires a single visible mip")
+            check_gather_sampler(sampler, gather_mips, comparison=bool(comparison))
             channels = {"1": 0, "2": 1, "4": 2, "8": 3}
+            if comparison and dmask != "1":
+                raise ValueError("Comparison gather requires red DMASK 0x1")
             if dmask not in channels:
                 raise ValueError("Gather requires a one-hot source DMASK")
             dest = registers(dst_first, dst_last, 4)
-            address = registers(addr_first, addr_last, 2 + bool(offset_mode) + (lod_mode == "_l"))
+            address = registers(addr_first, addr_last, 2 + bool(comparison) + bool(offset_mode) + (lod_mode == "_l"))
             image = registers(image_first, image_last, 8)
             state = registers(sampler_first, sampler_last, 4)
             if (max(dest.stop, address.stop) > 256 or max(image.stop, state.stop) > 106
@@ -4285,23 +4304,36 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Unsupported gather image or sampler binding")
             if any(f"v{n}" in sample_dest for n in (*dest, *address)):
                 raise ValueError("Gather overlaps an outstanding vector load")
-            addr = [vector[f"v{n}"] for n in address]
-            xoff, yoff = gather_offset(known_ssa_bits.get(addr.pop(0))) if offset_mode else (0, 0)
+            addr = [f"v{n}" for n in address]
+            xoff, yoff = gather_offset(known_ssa_bits.get(vector[addr.pop(0)])) if offset_mode else (0, 0)
+            if comparison:
+                reference_reg = addr.pop(0)
+                value = vector[reference_reg]
+                if isinstance(value, tuple) and value[0] == "entry_uv":
+                    reference = f"uv.{value[1]}"
+                elif value in ("uv.x", "uv.y"):
+                    reference = value
+                else:
+                    reference = fp_operand(reference_reg, scalar, vector, pending, sample_dest)
             mip = 0
             if lod_mode == "_l":
-                raw = known_ssa_bits.get(addr.pop())
+                raw = known_ssa_bits.get(vector[addr.pop()])
                 level = struct.unpack("<f", struct.pack("<I", raw))[0] if raw is not None else None
                 if level is None or not level.is_integer() or not 0 <= level < gather_mips:
                     raise ValueError("Gather requires a known integer LOD inside the view")
                 mip = int(level)
             coords = [f"uv.{value[1]}" if isinstance(value, tuple) and value[0] == "entry_uv" else value
-                      for value in addr]
+                      for value in (vector[reg] for reg in addr)]
             if any(not isinstance(value, str) or not (value in ("uv.x", "uv.y")
                    or value.startswith(("sample", "alu", "params"))) for value in coords):
                 raise ValueError("Unsupported gather coordinate")
             u, v = coords
-            lines[lines.index(SAMPLED_RESOURCES)] = GATHER_RESOURCES
-            lines.append(f"    float4 sample{i} = gather_2d(float2({u}, {v}), int2({xoff}, {yoff}), {mip}, {channels[dmask]});")
+            resources, function, operand = GATHER_RESOURCES, "gather_2d", channels[dmask]
+            if comparison:
+                resources = gather_compare_resources((sampler[0] >> 12) & 7)
+                function, operand = "gather_compare", reference
+            lines[lines.index(SAMPLED_RESOURCES)] = resources
+            lines.append(f"    float4 sample{i} = {function}(float2({u}, {v}), int2({xoff}, {yoff}), {mip}, {operand});")
             sample_kind = "gather"
             samples += 1
             vector_loads += 1

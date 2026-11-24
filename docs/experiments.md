@@ -3396,8 +3396,7 @@ floating-point arithmetic. Use a static signed six-bit XY offset with `_o`.
 The address uses consecutive full-width VGPRs in offset (if present), U, V,
 LOD (if present) order. Wait for both descriptors with `lgkmcnt(0)` and for
 the gather result with `vmcnt(0)`. The profile accepts one gather and rejects
-comparison forms, additional image sampling, NSA, A16, D16 and other image
-modifiers. See the MIMG address and sampler tables in the
+additional image sampling, NSA, A16, D16 and other image modifiers. See the MIMG address and sampler tables in the
 [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture).
 
 The fixture assembles and disassembles all 24 opcode and DMASK pairs with
@@ -3416,6 +3415,36 @@ ctest --preset dev --no-tests=error -j 1 -R '^pixel_aot_gather_(warp|hardware)$'
 
 ```bash
 python3 -B tests/pixel_gather_check.py --binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+### gfx1030 2D comparison gathers
+
+`image_gather4_c`, `image_gather4_c_o`, `image_gather4_c_lz`,
+`image_gather4_c_lz_o`, `image_gather4_c_l` and `image_gather4_c_l_o` use
+`--cpu gfx1030 --gather-mips <count>` and the same view, coordinate, filter
+and mip contract as ordinary gathers. For these forms the profile requires
+red DMASK `0x1`, a float depth component in the view's red channel, and a
+reference and depth texels in `[0, 1]`. The address puts the reference after
+any packed offset and before U and V. An explicit LOD comes last. The
+`DEPTH_COMPARE_FUNC` field in native sampler word 0 selects the comparison.
+The shader compares the reference against each selected depth texel and
+returns four separate float `0` or `1` values in gather order.
+
+The fixture round-trips all six mnemonics through LLVM 15 and the archive
+CLI. Thirteen translated draws exercise all eight comparison functions and
+all six mnemonics against a CPU reference. Each has a separate D3D12
+`GatherCmpRed` draw that binds the selected mip as a single-level scalar
+depth view to check the predicates and lane order. Mutations reverse the
+comparison, substitute the reference, swap two taps, and change the
+selected mip or signed offset.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -j 1 -R '^pixel_aot_compare_gather_(warp|hardware)$' -V
+```
+
+```bash
+python3 -B tests/pixel_compare_gather_check.py --binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
 ### gfx1030 2D image stores
