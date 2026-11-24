@@ -2914,6 +2914,19 @@ for count in range(2, 5):
     stride = 4 * (count + 1)
     MTBUF_LOAD_CASES.append((f"mtbuf_load_{channels}", [*single[:6], load, single[7], store, single[-1]],
                              binding | {"stride": stride, "source_stride": stride}))
+for components in range(1, 5):
+    channels = "xyzw"[:components]
+    count = (components + 1) // 2
+    data = "v10" if count == 1 else "v[10:11]"
+    fmt = f"BUF_FMT_{'16_' * (4 if components == 3 else components)}UINT"
+    load = (f"tbuffer_load_format_d16_{channels} {data}, v8, s[16:19], 0 "
+            f"format:[{fmt}] idxen offset:4")
+    _, single, binding = MTBUF_LOAD_CASES[0]
+    store = single[8] if count == 1 else "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen offset:4"
+    last = 9 + count
+    mask = [f"v_and_b32_e32 v{last}, 0xffff, v{last}"] if components % 2 else []
+    MTBUF_LOAD_CASES.append((f"mtbuf_load_d16_{channels}", [*single[:6], load, single[7], *mask, store, single[-1]],
+                             binding | {"stride": 4 * (count + 1), "source_stride": 12}))
 
 
 def mtbuf_load_controls():
@@ -2936,7 +2949,7 @@ def mtbuf_load_controls():
             variant(lines, ("s_waitcnt lgkmcnt(0)", "")), 32, **binding)
     rejects("Unsupported read address", aot.lower, lines, 32, **(binding | {"source_stride": None}))
     rejects("Unsupported typed buffer read target", aot.lower, lines, 32, **(binding | {"cpu": "gfx1013"}))
-    for _, lines, binding in MTBUF_LOAD_CASES[1:]:
+    for _, lines, binding in MTBUF_LOAD_CASES[1:4]:
         load = lines[6]
         rejects("Unverified buffer read destination", aot.lower,
                 variant(lines, (load, load.replace(load.split()[1], "v10,"))), 32, **binding)
@@ -2947,6 +2960,19 @@ def mtbuf_load_controls():
                 variant(lines, (load, load + "\nv_mov_b32_e32 v12, v11")), 32, **binding)
         rejects("Read leaves its source element", aot.lower, lines, 32,
                 **(binding | {"source_stride": binding["source_stride"] - 4}))
+    for _, lines, binding in MTBUF_LOAD_CASES[4:]:
+        load = lines[6]
+        fmt = load.split("format:[")[1].split("]")[0]
+        rejects("Unsupported typed buffer read format", aot.lower,
+                variant(lines, (fmt, "BUF_FMT_32_UINT")), 32, **binding)
+        rejects("before s_waitcnt vmcnt(0)", aot.lower, variant(lines, ("s_waitcnt vmcnt(0)", "")), 32, **binding)
+        rejects("Unverified read offset", aot.lower,
+                variant(lines, (load, load.replace("offset:4", "offset:2"))), 32, **binding)
+        if load.split()[0].endswith(("_x", "_xyz")):
+            mask = lines[8]
+            rejects("Store data is not a known word", aot.lower, variant(lines, (mask, "")), 32, **binding)
+            rejects("Unverified ALU operand", aot.lower,
+                    variant(lines, (mask, mask.replace("0xffff", "0x1ffff"))), 32, **binding)
 
 
 def mtbuf_load_draw(directory, compiler, renderer, backend):
@@ -2955,7 +2981,9 @@ def mtbuf_load_draw(directory, compiler, renderer, backend):
     for name, lines, binding in MTBUF_LOAD_CASES:
         load = lines[6]
         op = load.split()[0]
-        count = len(op.rsplit("_", 1)[-1])
+        packed = "_d16_" in op
+        components = len(op.rsplit("_", 1)[-1])
+        count = (components + 1) // 2 if packed else components
         src, cso, case = (directory / f"{name}.{ext}" for ext in ("hlsl", "cso", "case"))
         src.write_text(aot.lower(lines, 32, **binding), encoding="ascii")
         compile = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
@@ -2965,13 +2993,20 @@ def mtbuf_load_draw(directory, compiler, renderer, backend):
             words = [SENTINEL] * 320
             for gid in range(32 * groups):
                 output = gid * (count + 1) + 1
-                first = gid * (3 if count == 1 else count + 1) + 1
+                first = gid * (3 if count == 1 or packed else count + 1) + 1
                 words[output:output + count] = [source_word(first + i) for i in range(count)]
+                if packed and components % 2:
+                    words[output + count - 1] &= 0xffff
             case.write_bytes(struct.pack("<321I", groups, *words))
             result = subprocess.run(run)
             if result.returncode:
                 return result.returncode
-        if count == 1:
+        if packed:
+            swapped = "v_lshlrev_b32_e32 v22, 16, v10\nv_lshrrev_b32_e32 v23, 16, v10\nv_or_b32_e32 v10, v22, v23"
+            store = lines[-2]
+            mutant = aot.lower(variant(lines, (store, swapped + "\n" + store)), 32, **binding)
+            mismatch = 1
+        elif count == 1:
             # Stride 8 still admits the aligned read. Only lanes after lane 0 expose the error.
             mutant = aot.lower(lines, 32, **(binding | {"source_stride": 8}))
             mismatch = 3
@@ -2982,7 +3017,7 @@ def mtbuf_load_draw(directory, compiler, renderer, backend):
         subprocess.run(compile, check=True)
         bad = subprocess.run(run, capture_output=True, text=True)
         if bad.returncode != 1 or f"word={mismatch} expected=" not in bad.stderr:
-            raise AssertionError(f"{name}: incorrect source address escaped detection\n{bad.stderr}")
+            raise AssertionError(f"{name}: incorrect load escaped detection\n{bad.stderr}")
         print(bad.stderr, end="")
         accepted.append(op)
     if record := os.environ.get("FORM_COVERAGE_RECORD"):

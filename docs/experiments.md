@@ -2533,6 +2533,16 @@ The multichannel wave32 fixtures copy two to four DWORDs in order after a
 sentinel word in each record. They compare the complete 320-word UAV for
 one and two groups. Moving the source read one DWORD earlier must mismatch
 at output word 1.
+
+The four `tbuffer_load_format_d16_*` forms accept 16-bit UINT components
+(`xyz` uses the four-component format). Consecutive pairs already have the
+byte order of a DWORD load, first component in the low half. The entire
+rounded-up DWORD span must be aligned and in range. For an odd component
+count, the final VGPR's high half is not modeled: `v_and_b32_e32` with the
+literal `0xffff` can extract the low half after the wait, but a whole-word
+use is rejected. The fixtures keep the halves distinct; swapping the
+first result word's halves must mismatch at output word 1.
+
 The LLVM 15 binary check also verifies the decoded instruction and the
 CLI's generated HLSL. These are desktop DXIL executions, not native runs
 of the assembled gfx1030 program.

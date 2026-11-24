@@ -915,6 +915,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified plane byte offset")
             vector[dst] = ("plane_bytes", row_tag[1], shift, *column_tag[1:])
+        elif ((m := re.fullmatch(r"v_and_b32_e32 v(\d+), (?:0xffff|65535), v(\d+)", line))
+              and isinstance(partial := vector.get(int(m[2])), tuple) and partial[0] == "source_low16"):
+            dst = int(m[1])
+            if dst > 255:
+                raise ValueError("Invalid vector destination")
+            vector[dst] = ("alu", f"(inputData.Load({partial[1]}) & 0xffffu)")
         elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32|max_u32|add_nc_u32|or_b32|xor_b32|lshlrev_b32|ashrrev_i32|sub_nc_u32|subrev_nc_u32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
               or (m := re.fullmatch(rf"(v_mul_lo_u32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
               or (m := re.fullmatch(rf"(v_mad_u32_u24) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
@@ -942,20 +948,24 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified row pitch byte offset")
             vector[dst] = ("pitch_bytes", row_tag[1], int(pitch, 0), *column_tag[1:])
-        elif m := re.fullmatch(r"(?:buffer_load_dword|tbuffer_load_format_(?P<channels>x|xy|xyz|xyzw)) "
+        elif m := re.fullmatch(r"(?:buffer_load_dword|tbuffer_load_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
                                r"(?P<dst>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+), s\[(?P<base>\d+):(?P<high>\d+)\], 0"
-                               r"(?(channels) format:\[(?P<format>BUF_FMT_(?:32_){1,4}UINT)\])"
+                               r"(?(channels) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
                                r"(?P<idxen> idxen)?(?P<offen> offen)?"
                                r"(?: offset:(?P<offset>\d+))?", line):
             channels = m["channels"]
-            count = len(channels) if channels else 1
+            packed = channels is not None and channels.startswith("d16_")
+            components = len(channels.removeprefix("d16_")) if channels else 1
+            count = (components + 1) // 2 if packed else components
             dst, *last = map(int, re.findall(r"\d+", m["dst"]))
             base, high = int(m["base"]), int(m["high"])
             offset = int(m["offset"] or 0)
             addr, idxen, offen = m["addr"], m["idxen"], m["offen"]
             if channels and (cpu != "gfx1030" or not idxen or offen):
                 raise ValueError("Unsupported typed buffer read target or address mode")
-            if channels and m["format"] != f"BUF_FMT_{'32_' * count}UINT":
+            # The three-component D16 form uses the four-component 16-bit format.
+            format_components = 4 if packed and components == 3 else components
+            if channels and m["format"] != f"BUF_FMT_{('16_' if packed else '32_') * format_components}UINT":
                 raise ValueError("Unsupported typed buffer read format")
             if last != ([] if count == 1 else [dst + count - 1]) or dst + count > 256:
                 raise ValueError("Unverified buffer read destination")
@@ -987,7 +997,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Unsupported read address")
             for reg, address in enumerate(addresses, dst):
                 vector.pop(reg, None)
-                loading[reg] = ("source", address)
+                # Track only the low half of an odd trailing component. Whole-word consumers cannot read it.
+                kind = "source_low16" if packed and components % 2 and reg == dst + count - 1 else "source"
+                loading[reg] = (kind, address)
         elif m := re.fullmatch(r"buffer_store_dword(?:x([234]))? (v\d+|v\[\d+:\d+\]), (off|v\d+|v\[\d+:\d+\]), "
                                r"s\[(\d+):(\d+)\], 0( idxen)?( offen)?(?: offset:(\d+))?", line):
             count = int(m[1] or 1)
