@@ -942,16 +942,24 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified row pitch byte offset")
             vector[dst] = ("pitch_bytes", row_tag[1], int(pitch, 0), *column_tag[1:])
-        elif m := re.fullmatch(r"(?:buffer_load_dword|(?P<typed>tbuffer_load_format_x)) "
-                               r"v(?P<dst>\d+), (?P<addr>off|v\d+), s\[(?P<base>\d+):(?P<high>\d+)\], 0"
-                               r"(?(typed) format:\[BUF_FMT_32_UINT\])(?P<idxen> idxen)?(?P<offen> offen)?"
+        elif m := re.fullmatch(r"(?:buffer_load_dword|tbuffer_load_format_(?P<channels>x|xy|xyz|xyzw)) "
+                               r"(?P<dst>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+), s\[(?P<base>\d+):(?P<high>\d+)\], 0"
+                               r"(?(channels) format:\[(?P<format>BUF_FMT_(?:32_){1,4}UINT)\])"
+                               r"(?P<idxen> idxen)?(?P<offen> offen)?"
                                r"(?: offset:(?P<offset>\d+))?", line):
-            dst, base, high = int(m["dst"]), int(m["base"]), int(m["high"])
+            channels = m["channels"]
+            count = len(channels) if channels else 1
+            dst, *last = map(int, re.findall(r"\d+", m["dst"]))
+            base, high = int(m["base"]), int(m["high"])
             offset = int(m["offset"] or 0)
             addr, idxen, offen = m["addr"], m["idxen"], m["offen"]
-            if m["typed"] and (cpu != "gfx1030" or not idxen or offen):
+            if channels and (cpu != "gfx1030" or not idxen or offen):
                 raise ValueError("Unsupported typed buffer read target or address mode")
-            if (dst > 255 or high != base + 3 or base % 4 or high > 105
+            if channels and m["format"] != f"BUF_FMT_{'32_' * count}UINT":
+                raise ValueError("Unsupported typed buffer read format")
+            if last != ([] if count == 1 else [dst + count - 1]) or dst + count > 256:
+                raise ValueError("Unverified buffer read destination")
+            if (high != base + 3 or base % 4 or high > 105
                     or pending.intersection(range(base, high + 1))):
                 raise ValueError("Unverified buffer read descriptor")
             kinds = tuple(scalar.get(base + i) for i in range(4))
@@ -964,21 +972,22 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Unverified read offset")
             tag = vector.get(int(addr[1:])) if addr != "off" else None
             if addr == "off" and not idxen and not offen:
-                address = f"{offset}u"
+                addresses = [f"{offset}u"]
             elif (offen and not idxen and isinstance(tag, tuple) and tag[0] == "thread_bytes"
                   and 2 <= tag[2] < 32):
                 # A shift below 2 gives unaligned byte offsets, which ByteAddressBuffer.Load cannot express.
-                address = f"(tid.{AXES[tag[1]]} << {tag[2]}u) + {offset}u"
+                addresses = [f"(tid.{AXES[tag[1]]} << {tag[2]}u) + {offset}u"]
             elif (idxen and not offen and source_stride is not None and isinstance(tag, tuple)
                   and tag[0] == "thread"):
                 # idxen: index * stride + instruction offset, inside one source element.
-                if offset + 4 > source_stride:
+                if offset + 4 * count > source_stride:
                     raise ValueError("Read leaves its source element")
-                address = f"tid.{AXES[tag[1]]} * {source_stride}u + {offset}u"
+                addresses = [f"tid.{AXES[tag[1]]} * {source_stride}u + {offset + 4*i}u" for i in range(count)]
             else:
                 raise ValueError("Unsupported read address")
-            vector.pop(dst, None)
-            loading[dst] = ("source", address)
+            for reg, address in enumerate(addresses, dst):
+                vector.pop(reg, None)
+                loading[reg] = ("source", address)
         elif m := re.fullmatch(r"buffer_store_dword(?:x([234]))? (v\d+|v\[\d+:\d+\]), (off|v\d+|v\[\d+:\d+\]), "
                                r"s\[(\d+):(\d+)\], 0( idxen)?( offen)?(?: offset:(\d+))?", line):
             count = int(m[1] or 1)

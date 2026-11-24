@@ -2516,7 +2516,11 @@ requires no numeric conversion. The accepted address is `idxen` with a
 verified dispatch-thread index, zero scalar offset, and a DWORD-aligned
 instruction offset inside an explicit `--source-stride`. Both descriptor
 and vector load waits must complete before the corresponding registers are
-used. Other formats, address modes, and modifiers are not accepted.
+used. The `xy`, `xyz`, and `xyzw` forms require two, three, and four 32-bit
+UINT format components respectively, and a matching contiguous VGPR range.
+The complete read must fit within one record. Every destination word is
+unavailable until `vmcnt(0)`. Other formats, address modes, and modifiers
+are not accepted.
 
 The binding assumes a valid, unswizzled native descriptor and stable,
 in-range source bytes disjoint from the output. It does not emulate native
@@ -2525,6 +2529,10 @@ fixture reads byte 4 of each 12-byte source record and copies it to byte 4
 of each 8-byte output record. A CPU reference compares all 320 output words,
 including the gaps and tail, for one and three groups. With the source
 stride deliberately changed to 8, word 3 must mismatch on both backends.
+The multichannel wave32 fixtures copy two to four DWORDs in order after a
+sentinel word in each record. They compare the complete 320-word UAV for
+one and two groups. Moving the source read one DWORD earlier must mismatch
+at output word 1.
 The LLVM 15 binary check also verifies the decoded instruction and the
 CLI's generated HLSL. These are desktop DXIL executions, not native runs
 of the assembled gfx1030 program.

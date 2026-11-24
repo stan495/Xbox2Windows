@@ -2905,6 +2905,16 @@ MTBUF_LOAD_CASES = [("mtbuf_load_x", [
     "buffer_store_dword v10, v8, s[20:23], 0 idxen offset:4", "s_endpgm",
 ], DS_BINDING | {"stride": 8, "source_descriptor": 0x40, "source_stride": 12})]
 
+for count in range(2, 5):
+    channels = "xyzw"[:count]
+    data = f"v[10:{9 + count}]"
+    load = f"tbuffer_load_format_{channels} {data}, v8, s[16:19], 0 format:[BUF_FMT_{'32_' * count}UINT] idxen offset:4"
+    store = f"buffer_store_dwordx{count} {data}, v8, s[20:23], 0 idxen offset:4"
+    _, single, binding = MTBUF_LOAD_CASES[0]
+    stride = 4 * (count + 1)
+    MTBUF_LOAD_CASES.append((f"mtbuf_load_{channels}", [*single[:6], load, single[7], store, single[-1]],
+                             binding | {"stride": stride, "source_stride": stride}))
+
 
 def mtbuf_load_controls():
     _, lines, binding = MTBUF_LOAD_CASES[0]
@@ -2926,35 +2936,59 @@ def mtbuf_load_controls():
             variant(lines, ("s_waitcnt lgkmcnt(0)", "")), 32, **binding)
     rejects("Unsupported read address", aot.lower, lines, 32, **(binding | {"source_stride": None}))
     rejects("Unsupported typed buffer read target", aot.lower, lines, 32, **(binding | {"cpu": "gfx1013"}))
+    for _, lines, binding in MTBUF_LOAD_CASES[1:]:
+        load = lines[6]
+        rejects("Unverified buffer read destination", aot.lower,
+                variant(lines, (load, load.replace(load.split()[1], "v10,"))), 32, **binding)
+        rejects("Unsupported typed buffer read format", aot.lower,
+                variant(lines, (load, load.replace(load.split("format:[")[1].split("]")[0], "BUF_FMT_32_UINT"))),
+                32, **binding)
+        rejects("before s_waitcnt vmcnt(0)", aot.lower,
+                variant(lines, (load, load + "\nv_mov_b32_e32 v12, v11")), 32, **binding)
+        rejects("Read leaves its source element", aot.lower, lines, 32,
+                **(binding | {"source_stride": binding["source_stride"] - 4}))
 
 
 def mtbuf_load_draw(directory, compiler, renderer, backend):
     mtbuf_load_controls()
+    accepted = []
     for name, lines, binding in MTBUF_LOAD_CASES:
+        load = lines[6]
+        op = load.split()[0]
+        count = len(op.rsplit("_", 1)[-1])
         src, cso, case = (directory / f"{name}.{ext}" for ext in ("hlsl", "cso", "case"))
         src.write_text(aot.lower(lines, 32, **binding), encoding="ascii")
         compile = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
         subprocess.run(compile, check=True)
         run = [renderer, backend, "--compute-store-case", cso, case]
-        for groups in (1, 3):
+        for groups in ((1, 3) if count == 1 else (1, 2)):
             words = [SENTINEL] * 320
             for gid in range(32 * groups):
-                words[2 * gid + 1] = source_word(3 * gid + 1)
+                output = gid * (count + 1) + 1
+                first = gid * (3 if count == 1 else count + 1) + 1
+                words[output:output + count] = [source_word(first + i) for i in range(count)]
             case.write_bytes(struct.pack("<321I", groups, *words))
             result = subprocess.run(run)
             if result.returncode:
                 return result.returncode
-        # Stride 8 still admits the aligned read. Only lanes after lane 0 expose the error.
-        src.write_text(aot.lower(lines, 32, **(binding | {"source_stride": 8})), encoding="ascii")
+        if count == 1:
+            # Stride 8 still admits the aligned read. Only lanes after lane 0 expose the error.
+            mutant = aot.lower(lines, 32, **(binding | {"source_stride": 8}))
+            mismatch = 3
+        else:
+            mutant = aot.lower(variant(lines, (load, load.removesuffix(" offset:4"))), 32, **binding)
+            mismatch = 1
+        src.write_text(mutant, encoding="ascii")
         subprocess.run(compile, check=True)
         bad = subprocess.run(run, capture_output=True, text=True)
-        if bad.returncode != 1 or "word=3 expected=" not in bad.stderr:
-            raise AssertionError(f"{name}: incorrect source stride escaped detection\n{bad.stderr}")
+        if bad.returncode != 1 or f"word={mismatch} expected=" not in bad.stderr:
+            raise AssertionError(f"{name}: incorrect source address escaped detection\n{bad.stderr}")
         print(bad.stderr, end="")
+        accepted.append(op)
     if record := os.environ.get("FORM_COVERAGE_RECORD"):
         path = Path(record)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("tbuffer_load_format_x\n", encoding="utf-8")
+        path.write_text("\n".join(accepted) + "\n", encoding="utf-8")
     return 0
 
 
