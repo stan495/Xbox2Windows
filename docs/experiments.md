@@ -3574,15 +3574,51 @@ Check each draw as tightly packed, row-major little-endian RGBA32F.
 python3 -B tests/pixel_gather_bias_probe.py --readback image_gather4_b-magnify out/native-magnify.rgba32f
 ```
 
-The native runner and pipeline setup are external to the probe. Start
-with the ordinary magnification pair. If the explicit control matches
+Start with the ordinary magnification pair. If the explicit control matches
 mip 1 and the biased shader matches mip 2, the native result rejects the
 candidate clamp order. If the explicit control differs, first resolve
-the resource, quad or tap mismatch. Run the remaining pairs before using
-the candidate for lowering. Native and desktop execution evidence is
-pending. The four opcodes remain unsupported by the AOT translator.
-Fractional mip thresholds, non-affine or entry-only coordinates, dynamic
-bias, alternate view shapes and `_cl` are outside the probe.
+the resource, quad or tap mismatch. Readback from the native biased shaders
+is pending. The four opcodes still require a validated AOT lowering.
+
+#### Vulkan entry for the ordinary biased gathers
+
+`pixel_gather_bias_vulkan.py` builds the fullscreen vertex shader and three
+fragment shaders for each of the six ordinary cases. The fragment shaders use
+`OpImageGather` with `Bias`, `Lod`, or a single visible mip. The `_o` cases
+pass `ConstOffset` in every shader. The runner uploads the three exact RGBA32F
+levels and copies the 8×8 RGBA32F target to a host-visible buffer. Every readback
+is compared bit for bit against the CPU tap model and written below
+`out/gfx1030-gather-bias-vulkan/`, with SHA-256 digests in the console output.
+
+On Linux with Vulkan headers and loader, SPIRV-Tools and a Vulkan ICD installed,
+build the runner and verify the single-mip controls for all three view bases.
+This exercises the upload and readback on any supporting ICD. Binding a
+wrong view mip must distinguish it from the candidate mip at the CPU-predicted
+first differing tap.
+
+```sh
+mkdir -p out
+c++ -std=c++17 -O2 tests/pixel_gather_bias_vulkan.cpp -lvulkan -o out/pixel_gather_bias_vulkan
+python3 -B tests/pixel_gather_bias_vulkan.py spirv-as spirv-val --runner out/pixel_gather_bias_vulkan
+```
+
+On a gfx1030 device using RADV, run the native magnification discriminator
+and then repeat without `--case` to run the six ordinary cases. The native
+path requires `VK_AMD_texture_gather_bias_lod` and the format's
+`supportsTextureGatherLODBiasAMD` bit. Missing capabilities return 77. Use
+`--device` with a zero-based Vulkan device index to select the adapter.
+
+```sh
+RADV_DEBUG=ps,nocache python3 -B tests/pixel_gather_bias_vulkan.py spirv-as spirv-val \
+  --runner out/pixel_gather_bias_vulkan --native --case image_gather4_b-magnify \
+  > out/gfx1030-gather-bias-native.log 2>&1
+```
+
+Record the driver, gfx target, shader digests and raw readback. Confirm
+`image_gather4_b` and `image_gather4_l` in the driver ISA dump for the two
+full-view shaders. The offset case uses their `_o` forms. Comparison gather
+uses the raw native shader path above. The Vulkan AMD extension grants
+`Bias` and `Lod` operands to `OpImageGather` and `OpImageSparseGather`.
 
 ### gfx1030 2D image stores
 
