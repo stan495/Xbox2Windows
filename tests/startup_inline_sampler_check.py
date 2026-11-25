@@ -41,7 +41,41 @@ DYNAMIC_SOURCE = CLAMP_SOURCE.replace('v_mov_b32 v0,', 's_bfm_b32 s24, s9, 33\nv
 DYNAMIC_WORDS = CLAMP_WORDS.replace(bytes.fromhex('ff02007e0000a03f'), bytes.fromhex('09a11892ff02007e0000a03f'))
 
 
+def check_compare_sampler_constant():
+    """A comparison sample needs the sampler's four words as constants it can read.
+
+    image_compare refuses a sampler it cannot resolve to a constant run, because the comparison
+    function and the filter have to be taken from those words. The refusal is decided from the
+    symbol table, so a bare stage reaches it and a stage with four constant words gets past it.
+    """
+    def bare_stage(symbols=None):
+        stage = G.Stage.__new__(G.Stage)
+        stage.sym = dict(symbols or {})
+        stage.used_s = set()
+        stage.pipe = None
+        return stage
+
+    try:
+        bare_stage().image_compare(['v5', '[v1, v2, v3]', 's0', 's4'],
+                                   ['dim:SQ_RSRC_IMG_2D', 'dmask:0x1'], 'c')
+    except G.Unsupported as error:
+        assert str(error) == 'image_sample_c with a sampler that is not constant', error
+    else:
+        raise AssertionError('image_sample_c accepted an unresolved sampler')
+
+    # Four constant words must get past this guard: the bare stage then stops where it needs a
+    # pipeline, not here.
+    words = {n: ('const', 0) for n in range(4, 8)}
+    try:
+        bare_stage(words).image_compare(['v5', '[v1, v2, v3]', 's0', 's4'],
+                                          ['dim:SQ_RSRC_IMG_2D', 'dmask:0x1'], 'c')
+    except G.Unsupported as error:
+        assert 'sampler that is not constant' not in str(error), error
+    except AttributeError:
+        pass
+
 def controls():
+    check_compare_sampler_constant()
     fixtures = []
     for name, code, words in (
         ('clamp', CLAMP_WORDS, (0x2, 0, 0x00100000, 0)),

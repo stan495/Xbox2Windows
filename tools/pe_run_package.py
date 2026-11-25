@@ -39,6 +39,8 @@ def plan(report, *, allow_external=True):
         if row["status"] not in accepted:
             raise ValueError(f"{image}: {name[0]}!{name[1]}: {row['status']}")
         chain = row["chain"]
+        if not chain:
+            raise ValueError(f"{image}: {name[0]}!{name[1]}: empty resolution chain")
         for caller, provider in zip([image, *(step["provider"] for step in chain)], chain):
             if provider.get("package") and caller != provider["provider"]:
                 needs[caller].add(provider["provider"])
@@ -57,6 +59,8 @@ def plan(report, *, allow_external=True):
             raise ValueError("bundled dependency cycle: " + ", ".join(sorted(pending)))
         order.extend(finished)
         pending.difference_update(finished)
+    if not order:
+        raise ValueError("reachable package graph is empty")
     if order[-1] != report["entry"]:
         raise ValueError("entry is a dependency of a bundled image")
     return order, routes
@@ -78,8 +82,14 @@ def prototype(lib, name, args, result):
 def trap_key(name):
     """Parse a --trap-callable DLL!SYMBOL (or DLL!#ORDINAL) into an import key."""
     dll, sep, symbol = name.partition("!")
-    if not sep or not dll or not symbol or Path(dll).name != dll:
+    if (not sep or not dll or not symbol or dll in (".", "..")
+            or Path(dll).name != dll or "/" in dll or "\\" in dll):
         raise ValueError(f"--trap-callable expects DLL!SYMBOL or DLL!#ORDINAL, got {name!r}")
+    if symbol.startswith("#"):
+        ordinal = symbol[1:].lstrip("0")
+        if not (1 <= len(ordinal) <= 5 and ordinal.isascii() and ordinal.isdigit() and int(ordinal) <= 0xFFFF):
+            raise ValueError(f"--trap-callable expects DLL!SYMBOL or DLL!#ORDINAL, got {name!r}")
+        symbol = "#" + ordinal
     return dll.casefold(), symbol
 
 
@@ -304,7 +314,8 @@ def main():
         root = options.package.resolve(strict=True)
         shims = {name.casefold(): Path(path).resolve(strict=True) for name, path in options.shim}
         system = {name.casefold() for name in options.system}
-        if any(Path(name).name != name for name in system):
+        if any(not name or name in (".", "..") or Path(name).name != name or "/" in name or "\\" in name
+               for name in system):
             raise ValueError("System providers must be DLL basenames")
         report = inspect(root, options.entry)
         result = run(root, report, options.mapper.resolve(), shims, system,

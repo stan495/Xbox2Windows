@@ -277,6 +277,19 @@ def check_pure_python_controls() -> None:
         assert rt.export_compute_catalogue_entry(catalogue, synth_dxbc, signed, rejected) is None
         failed = {**accepted, "after": {**status, "module_status": "0x80004005"}}
         assert rt.export_compute_catalogue_entry(catalogue, synth_dxbc, signed, failed) is None
+        # Each remaining condition refuses on its own, with the same signed bytes otherwise accepted:
+        # an entry not marked signed, a module left on another triple and a failed container check.
+        for label, refused in (
+            ("unsigned entry", {**accepted, "signed": False}),
+            ("source triple", {**accepted, "after": {**status, "triple": rt.SOURCE_TRIPLE}}),
+            ("container status", {**accepted, "after": {**status, "container_status": "0x80aa0009"}}),
+        ):
+            assert rt.export_compute_catalogue_entry(catalogue, synth_dxbc, signed, refused) is None, label
+        # Only compute programs are published. The program kind is the high 16 bits of the DXIL
+        # version word: (5 << 16) | 0x65 is cs_6_5, while 0x65 alone is ps_6_5 (kind 0).
+        pixel_secs = {**out_secs, b"DXIL": rt.pack_dxil_program(0x65, 0x105, new_bc)}
+        pixel = rt.build_dxbc_container(list(pixel_secs.items()), digest=b"\x01" * 16)
+        assert rt.export_compute_catalogue_entry(catalogue, synth_dxbc, pixel, accepted) is None
         assert list(catalogue.iterdir()) == [expected]
 
     kept_dxbc, kept_info = rt.retarget_container(synth_dxbc, clear_root_flags=False)

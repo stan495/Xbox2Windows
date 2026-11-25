@@ -183,12 +183,24 @@ class BlockRowChecks(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     linearize_blocks(padded, width, height, name, pitch_blocks=pitch + 1)
 
+    def test_tile_blocks_padding_and_tight_length(self) -> None:
+        # 8x4 BC1 is two 8-byte blocks in one row; pitch 3 adds one padding block.
+        tight = block_tag(1, 0, 0, 8) + block_tag(1, 1, 0, 8)
+        self.assertEqual(tile_blocks(tight, 8, 4, "BC1_UNORM", pitch_blocks=3,
+                                     padding=b"\x5a" * 8), tight + b"\x5a" * 8)
+        with self.assertRaisesRegex(ValueError, "Expected one 8-byte padding block"):
+            tile_blocks(tight, 8, 4, "BC1_UNORM", pitch_blocks=3, padding=b"\x5a" * 16)
+        with self.assertRaisesRegex(ValueError, "Expected 16 tight bytes for BC1_UNORM, got 24"):
+            tile_blocks(tight + padding(8), 8, 4, "BC1_UNORM", pitch_blocks=3)
+
 
 class VolumeChecks(unittest.TestCase):
     def test_volume_round_trip(self) -> None:
         for index, name, width, height, depth in (
                 (7, "BC7_UNORM_VOLUME", 8, 8, 4),
-                (7, "BC7_UNORM_VOLUME", 68, 8, 2)):
+                (7, "BC7_UNORM_VOLUME", 68, 8, 2),
+                # 16 columns and one block row: exactly one 4 KiB tile per slice.
+                (7, "BC7_UNORM_VOLUME", 64, 4, 2)):
             columns, rows = columns_rows(width, height)
             slices = [tight_volume_slice(index, width, height, z) for z in range(depth)]
             payload = tile_volume_4k_s(slices, width, height, depth, name)
@@ -246,6 +258,11 @@ class VolumeChecks(unittest.TestCase):
                 tile_volume_4k_s(slices, width, height, bad_depth, name)
             with self.assertRaises(ValueError):
                 linearize_volume_4k_s(payload, width, height, bad_depth, name)
+        # Zero depth is refused even when the slice list and payload agree with it.
+        with self.assertRaisesRegex(ValueError, "Expected a positive volume depth"):
+            tile_volume_4k_s([], width, height, 0, name)
+        with self.assertRaisesRegex(ValueError, "Expected a positive volume depth"):
+            linearize_volume_4k_s(b"", width, height, 0, name)
 
 
 if __name__ == "__main__":

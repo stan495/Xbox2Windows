@@ -148,7 +148,7 @@ int main(int argc, char** argv)
     expect(store.read_blob("slot-none", "profile.dat", bytes) == Status::not_found, "missing container is not_found");
 
     // Names that could leave the store are refused and nothing is created outside it.
-    const char* bad[] = {"", "..", ".", "../x", "a/b", "a\\b", "/abs", "\\abs", "C:x", "C:\\x", "a..b", "x.", "NUL", "com1.txt", "a\nb", "n*", "a.x2w-part"};
+    const char* bad[] = {"", "..", ".", "../x", "a/b", "a\\b", "/abs", "\\abs", "C:x", "C:\\x", "a..b", "x.", "NUL", "com1.txt", "a\nb", "n*", "a.x2w-part", " x", "x ", "  double-lead", "CON .txt", "nul .dat", "com9.txt", "lpt9"};
     for (const char* name : bad) {
         expect(!x2w_save::valid_name(name), name);
         expect(store.create_container(name) == Status::bad_name, "bad container name refused");
@@ -159,6 +159,12 @@ int main(int argc, char** argv)
         expect(store.delete_container(name) == Status::bad_name, "bad container delete refused");
     }
     expect(!x2w_save::valid_name(std::string(x2w_save::max_name_bytes + 1, 'a')), "name length is capped");
+    // The accepted side of the same cap: a name of exactly max_name_bytes is legal.
+    expect(x2w_save::valid_name(std::string(x2w_save::max_name_bytes, 'a')), "a name at the cap is accepted");
+    // Names that only look like devices stay legal: the refusal is COM0-9 and LPT0-9 as the
+    // whole stem, not every name that starts with those letters.
+    for (const char* name : {"COMX", "CONSOLE", "com10", "LPT", "aux2.dat"})
+        expect(x2w_save::valid_name(name), name);
     expect(store.write_blob("slot-a", "big", first.data(), x2w_save::max_blob_bytes + 1) == Status::too_large, "size is capped");
     expect(!fs::exists(root / "x") && !fs::exists(root / "abs"), "nothing outside the store root");
 
@@ -228,6 +234,9 @@ int main(int argc, char** argv)
         const long u = table.begin_update(0);
         table.close(0);
         expect(u >= 0 && table.update_container(static_cast<std::size_t>(u)) == "held-0", "an open update keeps its container entry after close");
+        const long after_close = table.begin_update(0);
+        expect(after_close == -1, "a closed container cannot start an update while another update keeps its entry");
+        if (after_close >= 0) table.end_update(static_cast<std::size_t>(after_close));
         table.end_update(static_cast<std::size_t>(u));
         expect(table.open("now-free") >= 0, "the entry is reclaimed once the update ends");
     }

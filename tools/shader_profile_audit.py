@@ -2,11 +2,13 @@
 
 import argparse
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 import hashlib
 import itertools
 import json
 import mmap
 from pathlib import Path
+import struct
 
 import compute_store_aot
 import depth_mask_aot
@@ -37,12 +39,29 @@ def coverage_bindings(slot):
 def first_diagnostic(exc):
     reason = str(exc)
     if reason.startswith("Unsupported instruction "):
-        return "unsupported " + reason.partition(": ")[2].split()[0]
+        tokens = reason.partition(": ")[2].split()
+        return "unsupported " + tokens[0] if tokens else reason
     return reason
 
 
+def _require_bytes(value, label):
+    if not isinstance(value, (bytes, bytearray, memoryview)):
+        raise ValueError(f"{label} must be bytes-like")
+    return value
+
+
+def _emit_noop(_profile, _source):
+    return None
+
+
 def pixel_profiles(code, llvm, emit):
+    _require_bytes(code, "Pixel shader code")
+    if len(code) % 4:
+        raise ValueError("Pixel shader code must be 4-byte aligned")
+    emit = emit if emit is not None else _emit_noop
     decoded = pixel_aot.disassemble(code, llvm, offsets=True)
+    if not isinstance(decoded, list) or any(not isinstance(item, tuple) or len(item) != 2 for item in decoded):
+        raise ValueError("Malformed pixel shader disassembly")
     lines = [line for _, line in decoded]
     profiles = []
     first_general = None
@@ -90,7 +109,16 @@ def pixel_profiles(code, llvm, emit):
 
 
 def compute_profiles(code, group_size, llvm, emit):
+    _require_bytes(code, "Compute shader code")
+    if len(code) % 4:
+        raise ValueError("Compute shader code must be 4-byte aligned")
+    if (not isinstance(group_size, tuple) or len(group_size) != 3
+            or any(isinstance(n, bool) or not isinstance(n, int) or n <= 0 for n in group_size)):
+        raise ValueError("Invalid compute thread group dimensions")
+    emit = emit if emit is not None else _emit_noop
     lines = pixel_aot.disassemble(code, llvm)
+    if not isinstance(lines, list):
+        raise ValueError("Malformed compute shader disassembly")
     single = group_size == (1, 1, 1)
     choices = [(4, None), (5, None)] if single else [(5, 6), (4, 5)]
     strides = [None] if single else [4, 8, 12, 16]
@@ -113,10 +141,27 @@ def compute_profiles(code, group_size, llvm, emit):
 
 
 def classify(blob, sections, stage, llvm, emit):
+    if isinstance(stage, bool) or not isinstance(stage, int) or stage < 0:
+        raise ValueError(f"Unknown shader stage: {stage}")
     if stage not in (0, 5, 13):
         return [], "no stage profile"
-    group_size = compute_store_aot.group_size(sections.get(b"PSV0", b"")) if stage == 5 else None
-    code = pixel_aot.container_code(sections[b"DXIL"], stage=stage, llvm=llvm)
+    if not isinstance(sections, Mapping):
+        raise ValueError("Missing container sections")
+    dxil = _require_bytes(sections.get(b"DXIL"), "DXIL section")
+    group_size = None
+    if stage in (5, 13):
+        psv = _require_bytes(sections.get(b"PSV0"), "PSV0 section")
+        if stage == 5:
+            group_size = compute_store_aot.group_size(psv)
+        else:
+            psv_size = struct.unpack_from("<I", psv)[0] if len(psv) >= 4 else 0
+            if not 48 <= psv_size <= len(psv) - 4 or psv[28] != 13:
+                raise ValueError("Invalid mesh PSV0 section")
+            if not isinstance(blob, (bytes, bytearray, memoryview)) or len(blob) < 32:
+                raise ValueError("Missing or truncated mesh container payload")
+    emit = emit if emit is not None else _emit_noop
+    features = pixel_aot.MESH_WAVE64 if stage == 13 else b""
+    code = pixel_aot.container_code(dxil, stage=stage, llvm=llvm, features=features)
     if stage == 0:
         return pixel_profiles(code, llvm, emit)
     if stage == 5:
@@ -142,8 +187,11 @@ def classify(blob, sections, stage, llvm, emit):
 
 
 def cb_diagnostic(program, llvm):
+    _require_bytes(program, "DXIL section")
     code = pixel_aot.container_code(program, stage=0, llvm=llvm)
     lines = pixel_aot.disassemble(code, llvm)
+    if not isinstance(lines, list):
+        raise ValueError("Malformed pixel shader disassembly")
     desc = pixel_cb_read.first_descriptor(lines)
     if desc is None:
         return "untraced descriptor", None, None, None, None
@@ -166,6 +214,18 @@ def cb_diagnostic(program, llvm):
 
 
 def scan(archive, llvm, source_dir=None, *, cb_reads=False):
+    if isinstance(archive, (str, Path)):
+        path = Path(archive)
+        if not path.is_file():
+            raise ValueError(f"Missing archive file: {path}")
+        with path.open("rb") as f:
+            if f.seek(0, 2):
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                    return scan(data, llvm, source_dir, cb_reads=cb_reads)
+            return scan(b"", llvm, source_dir, cb_reads=cb_reads)
+    if not isinstance(archive, (bytes, bytearray, memoryview, mmap.mmap)):
+        raise ValueError("Archive payload must be bytes-like or a path")
+    source_dir = Path(source_dir) if source_dir is not None else None
     cache = {}
     records, accepted = Counter(), Counter()
     profiles, first_stops = defaultdict(Counter), defaultdict(Counter)
@@ -198,7 +258,7 @@ def scan(archive, llvm, source_dir=None, *, cb_reads=False):
             first_stops[name][reason] += 1
             if cb_reads and stage == 0 and reason == "pixel lowering / first general profile: Unresolved constant buffer binding":
                 if digest not in cb_cache:
-                    cb_cache[digest] = cb_diagnostic(sections[b"DXIL"], llvm)
+                    cb_cache[digest] = cb_diagnostic(sections.get(b"DXIL"), llvm)
                 group, read, method, stop, probe = cb_cache[digest]
                 groups[group] += 1
                 modes[read.mode() if read else "untraced consumer or completion"] += 1
@@ -221,17 +281,19 @@ def scan(archive, llvm, source_dir=None, *, cb_reads=False):
     return result
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path)
     parser.add_argument("--llvm", required=True, help="Path or loader name for the LLVM 15 library")
     parser.add_argument("--source-dir", type=Path, help="Optional local directory for accepted HLSL by profile and container hash")
     parser.add_argument("--cb-reads", action="store_true", help="Trace first-profile unresolved constant buffer reads")
     args = parser.parse_args()
-    with args.archive.open("rb") as f:
-        if f.seek(0, 2):
-            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
-                result = scan(data, args.llvm, args.source_dir, cb_reads=args.cb_reads)
-        else:
-            result = scan(b"", args.llvm, args.source_dir, cb_reads=args.cb_reads)
+    try:
+        result = scan(args.archive, args.llvm, args.source_dir, cb_reads=args.cb_reads)
+    except (OSError, ValueError) as error:
+        parser.exit(1, f"Shader profile audit: {error}\n")
     print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()

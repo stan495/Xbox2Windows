@@ -2,7 +2,7 @@
 // subset. It loads the fixture-only DLL by explicit path, writes a test-owned
 // marker under the PLS directory, verifies the package mount path and unmount
 // status, and checks that no implemented call logged E_NOTIMPL. The negative
-// controls are the XPackage async stub and the XUserAddAsync stub.
+// controls are the XPackage async stub and XUserAddAsync(None), which the shim refuses.
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -433,7 +433,7 @@ bool log_checks(HMODULE module)
         }
         if (user && std::strcmp(entry.function, "XUserAddAsync") == 0) {
             if (entry.result != not_implemented) {
-                std::printf("FAIL: XUserAddAsync stub returned 0x%08lx\n",
+                std::printf("FAIL: XUserAddAsync(None) returned 0x%08lx\n",
                             static_cast<unsigned long>(entry.result));
                 return false;
             }
@@ -494,7 +494,7 @@ bool run_checks(const wchar_t* dll_path, const wchar_t* fixture_dir,
         return false;
     }
     if (user_add(XUserAddOptionsNone, nullptr) != not_implemented) {
-        std::printf("FAIL: XUserAddAsync is not a logged stub\n");
+        std::printf("FAIL: XUserAddAsync(None) is not refused\n");
         return false;
     }
     if (!log_checks(shim.module)) return false;

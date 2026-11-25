@@ -1,9 +1,11 @@
 """Translate the packaged upscaler's device and context-slot initialization."""
 import argparse
 from pathlib import Path
+import struct
 from uuid import UUID
 
 from iced_x86 import Mnemonic, Register
+import pefile
 
 from cpu_ranges import function_ranges
 from ffx_dispatch_profile import dispatch_slices
@@ -14,6 +16,7 @@ from ffx_version_query import INTEGER_HEADER, UPSCALER, checked_image, lower, re
 
 def generate(image):
     start, end = 0x27f8, 0x2938
+    methods = {8: "probe.retain(rcx)", 0x70: "probe.create(rcx, rdx, r8, r9)"}
     with checked_image(image, UPSCALER) as pe:
         if not any(lo <= start < end <= hi for lo, hi in function_ranges(pe, 0x2720)):
             raise ValueError("device calls outside backend callback")
@@ -24,7 +27,11 @@ def generate(image):
                 continue
             if ins.memory_base != Register.RAX:
                 raise ValueError(f"unexpected device call at {ins.ip:#x}")
-            method = {8: "probe.retain(rcx)", 0x70: "probe.create(rcx, rdx, r8, r9)"}[ins.memory_displacement]
+            method = methods.get(ins.memory_displacement)
+            if method is None:
+                raise ValueError(
+                    f"unexpected device call displacement {ins.memory_displacement:#x} at {ins.ip:#x}"
+                )
             calls[ins.ip] = f"rax = {method};"
         guid = pe.get_data(0x482e0, 16)
         if UUID(bytes_le=guid) != UUID("8efb471d-616c-4f49-90f7-127bb763fa51"):
@@ -49,11 +56,19 @@ def generate(image):
         + slots + "\n}\n" + recurrent)
 
 
-if __name__ == "__main__":
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
     parser.add_argument("output", type=Path)
-    args = parser.parse_args()
-    if args.output.suffix.lower() != ".cpp" or args.output.resolve() == args.image.resolve():
-        parser.error("choose a distinct .cpp output")
-    args.output.write_text(generate(args.image), encoding="ascii")
+    args = parser.parse_args(argv)
+    try:
+        if args.output.suffix.lower() != ".cpp" or args.output.resolve() == args.image.resolve():
+            raise ValueError("choose a distinct .cpp output")
+        args.output.write_text(generate(args.image), encoding="ascii")
+    except (OSError, ValueError, pefile.PEFormatError, struct.error) as error:
+        parser.exit(1, f"{error}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

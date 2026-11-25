@@ -28,7 +28,8 @@
       "targets": [
         "d3d12_sdk_check", "era_heap_check", "xmem_shim", "offscreen_check",
         "cpu_fuzz_lifted", "cpu_fuzz_lifted_o2", "pe_map", "intake_candidate",
-        "archive_gpu_reader", "archive_codec_gpu", "archive_texture_gpu_lifted", "startup_launch_probe"
+        "archive_gpu_reader", "archive_codec_gpu", "archive_texture_gpu_lifted", "startup_launch_probe",
+        "startup_indirect_dispatch", "startup_indirect_draw_indexed"
       ]
     },
     { "name": "release", "configurePreset": "release" }
@@ -41,7 +42,7 @@
       "displayName": "Windows pull request smoke tests",
       "filter": {
         "include": {
-          "name": "^(desktop_root_signature|era_heap_(allocation|failure)|xmem_shim_mapped_pages|cpu_aot_fuzz_smoke|cpu_archive_texture_gpu_warp|dual_uav_warp|spirv_.*_warp|static_exe_intake|descriptor_heap_paging(_swapped)?_warp|startup_launch|startup_tools_lint)$"
+          "name": "^(desktop_root_signature|era_heap_(allocation|failure)|xmem_shim_mapped_pages|cpu_aot_fuzz_smoke|cpu_archive_texture_gpu_warp|dual_uav_warp|spirv_.*_warp|static_exe_intake|descriptor_heap_paging(_swapped)?_warp|startup_launch|startup_tools_lint|startup_indirect_(dispatch|draw(_indexed)?|mesh|counts_control)_warp)$"
         }
       }
     },

@@ -3,6 +3,7 @@
 // with no Windows types, so the logic can be compiled and tested on its own.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -121,7 +123,7 @@ public:
     // Index of the update slot, or -1 (container not open, or no free update slot).
     long begin_update(std::size_t container)
     {
-        if (container >= capacity || names_[container].empty()) return -1;
+        if (container >= capacity || refs_[container] == 0) return -1;
         for (std::size_t i = 0; i < capacity; ++i)
             if (!updates_[i]) {
                 updates_[i] = static_cast<int>(container) + 1;
@@ -187,6 +189,15 @@ private:
     int updates_[capacity]{};  // container index + 1 of an open update, 0 = free
     std::vector<Action> staged_[capacity];
     std::size_t staged_bytes_[capacity]{};
+};
+
+// One entry of an enumeration. Names are the file names on disk, so they already passed valid_name.
+struct ContainerEntry {
+    std::string name;
+};
+struct BlobEntry {
+    std::string name;
+    std::uint64_t bytes = 0;
 };
 
 class Store {
@@ -355,6 +366,7 @@ public:
     // not at all. All or nothing; a blob missing from the container is not_found.
     Status read_blobs(std::string_view container, const std::vector<std::string>& blobs, std::vector<std::vector<unsigned char>>& out) const
     {
+        // x2w-seam: store-read
         const fs::path dir = container_dir(container);
         if (dir.empty()) return Status::bad_name;
         for (const std::string& blob : blobs)
@@ -366,9 +378,107 @@ public:
         FileLock publication;
         if (const Status locked = lock_container(publication, container, false); locked != Status::ok) return locked;
         std::vector<std::vector<unsigned char>> all(blobs.size());
-        for (std::size_t i = 0; i < blobs.size(); ++i)
+        for (std::size_t i = 0; i < blobs.size(); ++i) {
             if (const Status status = read_file(dir / blobs[i], all[i]); status != Status::ok) return status;
+            // x2w-seam: blob-read
+        }
         out = std::move(all);
+        return Status::ok;
+    }
+
+    // The containers of the store: directories directly below the root, by name (byte order).
+    // Links and junctions, plain files, and names valid_name refuses (the lock, staging and old
+    // suffixes included) are not listed. A root that does not exist yet lists as empty. `out` is
+    // replaced only on ok; on any other status it is left as it was.
+    Status list_containers(std::vector<ContainerEntry>& out) const
+    {
+        std::error_code ec;
+        const fs::file_status root_state = fs::symlink_status(root_, ec);
+        if (!fs::exists(root_state)) {
+            if (ec && root_state.type() != fs::file_type::not_found) return Status::io_error;
+            out.clear();
+            return Status::ok;
+        }
+        if (redirected(root_state)) return Status::bad_name;
+        if (!fs::is_directory(root_state)) return Status::io_error;
+        std::vector<ContainerEntry> found;
+        for (fs::directory_iterator it(root_, ec), end; !ec && it != end; it.increment(ec)) {
+            const fs::file_status state = it->symlink_status(ec);
+            if (ec) {
+                if (state.type() != fs::file_type::not_found) break;
+                ec.clear();  // removed since the directory was read
+                continue;
+            }
+            if (redirected(state) || !fs::is_directory(state)) continue;
+            std::string name = it->path().filename().string();
+            if (valid_name(name)) found.push_back({std::move(name)});
+        }
+        if (ec) return Status::io_error;
+        std::sort(found.begin(), found.end(), [](const ContainerEntry& a, const ContainerEntry& b) { return a.name < b.name; });
+        out = std::move(found);
+        return Status::ok;
+    }
+
+    // The blobs of one container as one generation, taken under the same shared lock as read_blobs:
+    // a commit from any process is listed whole or not at all. Regular files only, by name (byte
+    // order), with their sizes; links, directories and names valid_name refuses are not listed.
+    // not_found: no such container. busy: the publication point stayed locked for the whole lock
+    // timeout. too_large: a blob is over max_blob_bytes. `out` is replaced only on ok. With
+    // `payloads`, the listed blobs are also read under the same lock (one generation for names,
+    // sizes and bytes); it is replaced only on ok, in the order of `out`. `read_if`, when given, sees
+    // the listing first: when it returns false nothing is read and `payloads` is left empty.
+    Status list_blobs(std::string_view container, std::vector<BlobEntry>& out,
+                      std::vector<std::vector<unsigned char>>* payloads = nullptr,
+                      const std::function<bool(const std::vector<BlobEntry>&)>& read_if = {}) const
+    {
+        // x2w-seam: store-read
+        const fs::path dir = container_dir(container);
+        if (dir.empty()) return Status::bad_name;
+        std::error_code ec;
+        const fs::file_status dir_state = fs::symlink_status(dir, ec);
+        if (redirected(dir_state)) return Status::bad_name;
+        if (!fs::exists(dir_state))
+            return (ec && dir_state.type() != fs::file_type::not_found) ? Status::io_error : Status::not_found;
+        if (!fs::is_directory(dir_state)) return Status::io_error;
+        FileLock publication;
+        if (const Status locked = lock_container(publication, container, false); locked != Status::ok) return locked;
+        // Re-check under the lock: a concurrent delete_container or redirect swap can happen while waiting.
+        const fs::file_status locked_state = fs::symlink_status(dir, ec);
+        if (redirected(locked_state)) return Status::bad_name;
+        if (!fs::exists(locked_state))
+            return (ec && locked_state.type() != fs::file_type::not_found) ? Status::io_error : Status::not_found;
+        if (!fs::is_directory(locked_state)) return Status::io_error;
+        std::vector<BlobEntry> found;
+        for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+            const fs::file_status state = it->symlink_status(ec);
+            if (ec) {
+                if (state.type() != fs::file_type::not_found) break;
+                ec.clear();
+                continue;
+            }
+            if (redirected(state) || !fs::is_regular_file(state)) continue;
+            std::string name = it->path().filename().string();
+            if (!valid_name(name)) continue;
+            const std::uintmax_t size = it->file_size(ec);
+            if (ec) break;
+            if (size > max_blob_bytes) return Status::too_large;
+            found.push_back({std::move(name), static_cast<std::uint64_t>(size)});
+        }
+        if (ec) return Status::io_error;
+        std::sort(found.begin(), found.end(), [](const BlobEntry& a, const BlobEntry& b) { return a.name < b.name; });
+        if (payloads) {
+            std::vector<std::vector<unsigned char>> all;
+            if (!read_if || read_if(found)) {
+                all.resize(found.size());
+                for (std::size_t i = 0; i < found.size(); ++i) {
+                    if (const Status status = read_file(dir / found[i].name, all[i]); status != Status::ok) return status;
+                    found[i].bytes = all[i].size();
+                    // x2w-seam: blob-read
+                }
+            }
+            *payloads = std::move(all);
+        }
+        out = std::move(found);
         return Status::ok;
     }
 

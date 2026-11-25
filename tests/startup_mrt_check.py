@@ -13,6 +13,10 @@ from startup_stream_draw_check import vertex, vop1
 
 FLOAT_WORDS = (1, 2, 0x7fc00001, 0x80000001)
 INTEGER_WORD = 0x80000001
+# Typed formats whose channels are all 32 bits: DXGI value -> (shader output type, channels).
+INTEGER_FORMATS = ((42, 'uint', 1), (43, 'int', 1), (17, 'uint', 2), (18, 'int', 2), (3, 'uint', 4), (4, 'int', 4))
+# Narrower integer channels are refused until a readback shows how the hardware truncates them.
+REFUSED_INTEGER_FORMATS = (30, 32, 12, 14, 57, 59, 62, 64)
 
 
 def pixel(values, unorm=False):
@@ -86,10 +90,11 @@ def check(work, consumer, backend, kind, dxc, fxc):
 
     ps.write_bytes(pixel((INTEGER_WORD, 2, 3, 4), unorm=True))
     variants = {}
-    for fmt, expected_type in ((42, 'uint'), (43, 'int')):
+    for fmt, expected_type, channels in INTEGER_FORMATS:
         key, cleared = request(fmt, (fmt, 28))
         variants[fmt] = key
-        assert cleared.hex() == '000000000000ffff', cleared.hex()
+        # The harness clears every target to (0, 0, 1, 1); integer channels hold those values as words.
+        assert cleared == struct.pack(f'<{channels}I', *(0, 0, 1, 1)[:channels]) + bytes.fromhex('0000ffff'), cleared.hex()
         outputs = compile_pair(key)
         if outputs.get('0') == 'sint':
             outputs['0'] = 'int'
@@ -101,15 +106,24 @@ def check(work, consumer, backend, kind, dxc, fxc):
         del env['X2W_TEST_PUBLISH_MANIFEST']
         assert Path(str(output) + '.first').read_bytes() == cleared
         assert f'2 targets (format {fmt}) -> 0x00000000' in log, log
-        assert pixels == struct.pack('<I4B', INTEGER_WORD, 255, 0, 0, 255), pixels.hex()
-        print(f'{kind} {backend} {expected_type} MRT0={INTEGER_WORD:08x}; UNORM MRT1=ff0000ff')
+        words = (INTEGER_WORD, 2, 3, 4)[:channels]
+        assert pixels == struct.pack(f'<{channels}I4B', *words, 255, 0, 0, 255), pixels.hex()
+        print(f'{kind} {backend} {expected_type} format {fmt} MRT0={pixels[:4 * channels].hex()}; UNORM MRT1=ff0000ff')
         if fmt == 42:
+            for narrow in REFUSED_INTEGER_FORMATS:
+                line = f'rtv1 {gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes())} {narrow} 28'
+                refused = f'{gfx2hlsl.fnv(line.encode("ascii")):016x}'
+                (cache / f'req_{refused}.rtv').write_text(line)
+                result = gfx2hlsl.translate_request(cache, int(refused, 16))
+                assert result.startswith('unsupported: unverified '), result
+                assert not (cache / f'{refused}.txt').exists()
+            print(f'{kind} {backend} narrow integer formats {REFUSED_INTEGER_FORMATS} refused at translation')
             # A pre-existing base translation may lack its original request files.
             base = f'{gfx2hlsl.pipeline_key(vs.read_bytes(), ps.read_bytes(), root.read_bytes()):016x}'
             compile_pair(base)
             for ext in ('a', 'b', 'root'):
                 (cache / f'req_{base}.{ext}').unlink()
-    assert variants[42] != variants[43]
+    assert len({variants[f] for f, _, _ in INTEGER_FORMATS}) == len(INTEGER_FORMATS)
     # A SINT artifact under the UINT cache key must be refused before PSO creation.
     unsigned = cache / f'{variants[42]}.txt'
     unsigned.write_bytes((cache / f'{variants[43]}.txt').read_bytes())
@@ -148,6 +162,16 @@ def check(work, consumer, backend, kind, dxc, fxc):
     else:
         assert pixels == exact, pixels.hex()
         print(f'{kind} {backend} constant baseline kept all four words')
+
+    # Narrower binary32 targets store the leading words only; a NaN payload and a negative denormal must survive.
+    narrow_words = (0x7fc00001, 0x80000001, 1, 2)
+    ps.write_bytes(pixel(narrow_words))
+    for fmt, channels in ((16, 2), (41, 1)):
+        key, _ = request(fmt, (fmt,))
+        assert compile_pair(key) == {'0': 'float'}
+        pixels, _ = draw(fmt)
+        assert pixels == struct.pack(f'<{channels}I', *narrow_words[:channels]), pixels.hex()
+        print(f'{kind} {backend} FLOAT format {fmt} exact {pixels.hex()}')
     return 0
 
 

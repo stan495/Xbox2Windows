@@ -70,13 +70,21 @@ def generate(image: Path, package: bool, frame_planes: bool = False) -> str:
             + append_body + '\n}\n' + planes)
 
 
-if __name__ == "__main__":
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--package", action="store_true")
     parser.add_argument("--frame-planes", action="store_true")
-    args = parser.parse_args()
-    if args.output.suffix.lower() != ".cpp" or args.output.resolve() == args.image.resolve():
-        parser.error("choose a distinct .cpp output")
-    args.output.write_text(generate(args.image, args.package, args.frame_planes), encoding="ascii")
+    args = parser.parse_args(argv)
+    try:
+        if args.output.suffix.lower() != ".cpp" or args.output.resolve() == args.image.resolve():
+            parser.error("choose a distinct .cpp output")
+        args.output.write_text(generate(args.image, args.package, args.frame_planes), encoding="ascii")
+    except (OSError, ValueError, pefile.PEFormatError) as error:
+        parser.exit(1, f"{error}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

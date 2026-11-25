@@ -114,7 +114,41 @@ def run_unit_tests():
         assert launch_mod.format_fast_fail_diagnostic(7, 1.00, str(logdir / "trap.log"), {}) is None
         assert launch_mod.format_fast_fail_diagnostic(7, 2.50, str(logdir / "trap.log"), {}) is None
 
-    print("launch-unit: storage fallback/preservation, stale shader cache warning and fast-fail diagnostics passed")
+        # 5. Arguments reach the child unchanged: a trailing backslash must not swallow the closing
+        # quote, and embedded quotes are escaped. Expected command lines are written out by hand.
+        for argument, quoted in (
+            ("plain", '"plain"'),
+            ("", '""'),
+            ("with space", '"with space"'),
+            ("with\ttab", '"with\ttab"'),
+            ("D:\\saves\\", '"D:\\saves\\\\"'),
+            ("S:\\", '"S:\\\\"'),
+            ("C:\\dir\\file.txt", '"C:\\dir\\file.txt"'),
+            ('say "hi"', '"say \\"hi\\""'),
+            ('""', '"\\"\\""'),
+            ('a\\"b', '"a\\\\\\"b"'),
+            ("x\\\\\\", '"x\\\\\\\\\\\\"'),
+        ):
+            assert launch_mod.quote_argument(argument) == quoted, (argument, launch_mod.quote_argument(argument), quoted)
+        if os.name == "nt":
+            import ctypes
+            import ctypes.wintypes as wintypes
+            shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+            shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+            shell32.CommandLineToArgvW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.LocalFree.restype = wintypes.HLOCAL
+            kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+            arguments = ["C:\\Program Files\\app.exe", "D:\\saves\\", "with\ttab", 'say "hi"', '""', 'a\\"b', "x\\\\", "", "plain"]
+            count = ctypes.c_int()
+            parsed = shell32.CommandLineToArgvW(" ".join(launch_mod.quote_argument(a) for a in arguments), ctypes.byref(count))
+            assert parsed, f"CommandLineToArgvW failed: error {ctypes.get_last_error()}"
+            try:
+                assert [parsed[i] for i in range(count.value)] == arguments, [parsed[i] for i in range(count.value)]
+            finally:
+                kernel32.LocalFree(parsed)
+
+    print("launch-unit: storage fallback/preservation, stale shader cache warning, fast-fail diagnostics and argument quoting passed")
     return 0
 
 

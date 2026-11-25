@@ -3,6 +3,7 @@ import argparse
 from pathlib import Path
 
 from iced_x86 import Mnemonic as M, OpKind as K, Register as R
+import pefile
 
 from bink_descriptors_aot import BINK_SHA256
 from bink_heap_aot import leaf_body
@@ -16,10 +17,16 @@ def generate(image):
         entry = export_rva(pe, "BinkAllocateFrameBuffers")
         owned = [ins for lo, hi in function_ranges(pe, entry) for ins in region(pe, lo, hi)]
         # Use a desktop frame in place of the MSVC prologue, cookie and epilogue.
-        first = next(n for n, i in enumerate(owned)
-                     if i.mnemonic == M.MOV and (i.op0_register, i.op1_register) == (R.RDI, R.RDX))
-        failure = next(n for n, i in enumerate(owned) if i.mnemonic == M.XOR
-                       and i.op0_register == i.op1_register == R.EAX)
+        first = next((n for n, i in enumerate(owned)
+                      if i.mnemonic == M.MOV and (i.op0_register, i.op1_register) == (R.RDI, R.RDX)), None)
+        if first is None:
+            raise ValueError("missing mov rdi, rdx anchor in BinkAllocateFrameBuffers")
+        failure = next((n for n, i in enumerate(owned) if i.mnemonic == M.XOR
+                        and i.op0_register == i.op1_register == R.EAX), None)
+        if failure is None:
+            raise ValueError("missing xor eax, eax anchor in BinkAllocateFrameBuffers")
+        if failure <= first:
+            raise ValueError("invalid frame allocator anchor order: xor eax, eax precedes mov rdi, rdx")
         body = owned[first:failure+1]
         sites = [i for i in body if i.mnemonic == M.CALL]
         if len(sites) != 9 or any(i.op0_kind != K.NEAR_BRANCH64 for i in sites):
@@ -57,11 +64,19 @@ extern "C" __declspec(dllexport) uint32_t frame_allocate(word context, word fram
 """ + code + "\n}\n"
 
 
-if __name__ == "__main__":
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
     parser.add_argument("output", type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.output.suffix.lower() != ".cpp" or args.output.resolve() == args.image.resolve():
         parser.error("choose a distinct .cpp output")
-    args.output.write_text(generate(args.image), encoding="ascii")
+    try:
+        args.output.write_text(generate(args.image), encoding="ascii")
+    except (OSError, ValueError, pefile.PEFormatError) as error:
+        parser.exit(1, f"{error}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -65,6 +65,19 @@ class CensusChecks(unittest.TestCase):
         self.assertEqual(result["cache_index"]["distinct_spans"], 5)
         self.assertEqual(result["cache_index"]["key"], "(code_offset, allocation_size)")
         self.assertEqual(result["cache_index"]["program_validation"], "not performed")
+        # The index follows the header and three tables: 128 + 1 * 0x70 + 2 * 0x18 + 3 * 8.
+        self.assertEqual(result["cache_index"]["index_offset"], 312)
+        self.assertEqual(result["cache_index"]["code_base"], base)
+
+    def test_header_digest_covers_bytes_4_through_19(self):
+        # Changing only the first or the last digest byte gives a new header key.
+        first, last = bytearray(container(1, 17)), bytearray(container(1, 17))
+        first[4] = 9
+        last[19] = 9
+        result = census(record(container(1, 17)) + record(first) + record(last))
+        self.assertEqual(result["archive_records"]["count"], 3)
+        self.assertEqual(result["dxbc_header_digests"]["count"], 3)
+        self.assertEqual(result["classification_cache"]["count"], 3)
 
     def test_profile_audit_keeps_occurrences_and_sha256_cache(self):
         # Isolate record counting from LLVM classification. Each distinct full
@@ -97,6 +110,25 @@ class CensusChecks(unittest.TestCase):
         data[:4] = b"PS\x00\x09"
         self.assertEqual(cache_index(data, 128)["count"], 0)
 
+    def test_index_bounds_are_inclusive(self):
+        # The fixture leaves a 96-byte code area; an allocation may end on its last byte.
+        data, base = cache_fixture([(80, 16)])
+        self.assertEqual(cache_index(data, base)["distinct_spans"], 1)
+        # 1 << 20 aliased entries is the largest accepted index; one more is refused.
+        # Zero table counts put the index at 128 and the code area right after it.
+        for count, accepted in ((1 << 20, True), ((1 << 20) + 1, False)):
+            data = bytearray(128 + count * 8 + 16)
+            data[:4] = b"PS\x00\x09"
+            struct.pack_into("<4I", data, 80, 0, 0, 0, count)
+            data[128:128 + count * 8] = struct.pack("<2I", 0, 16) * count
+            with self.subTest(count=count):
+                if accepted:
+                    result = cache_index(data, 128 + count * 8)
+                    self.assertEqual((result["count"], result["distinct_spans"]), (count, 1))
+                else:
+                    with self.assertRaisesRegex(ValueError, "index entry limit"):
+                        cache_index(data, 128 + count * 8)
+
     def test_bad_cache_headers_and_tables(self):
         data, base = cache_fixture()
         for length in (0, 4, 127):
@@ -114,7 +146,7 @@ class CensusChecks(unittest.TestCase):
             cache_index(data, base - 1)
 
     def test_bad_allocations(self):
-        for entries in ([(0, 0)], [(1, 16)], [(0, 97)], [(0xFFFFFFF0, 32)],
+        for entries in ([(0, 0)], [(1, 16)], [(8, 16)], [(0, 97)], [(0xFFFFFFF0, 32)],
                         [(0, 32), (16, 16)], [(0, 16), (0, 32)]):
             data, base = cache_fixture(entries)
             with self.subTest(entries=entries), self.assertRaises(ValueError):

@@ -343,6 +343,80 @@ int struct_return_checks(ID3D12Device* device)
         }
         std::printf("struct_return %s: properties and guards match\n", test.name);
     }
+
+    // The adapter must pass heap_type through. A DEFAULT heap has no CPU page property on any
+    // adapter, so its properties differ from UPLOAD's even where READBACK's do not.
+    const auto default_expected = device->GetCustomHeapProperties(node_mask, D3D12_HEAP_TYPE_DEFAULT);
+    if (std::memcmp(&default_expected, &expected, sizeof(expected)) == 0) {
+        std::fputs("FAIL: struct_return heap type: DEFAULT and UPLOAD properties are equal\n", stderr);
+        return 1;
+    }
+    struct TypeCase {
+        const char* name;
+        D3D12_HEAP_TYPE type;
+    };
+    constexpr TypeCase type_cases[] = {
+        {"default", D3D12_HEAP_TYPE_DEFAULT},
+        {"readback", D3D12_HEAP_TYPE_READBACK},
+    };
+    for (const auto& type_case : type_cases) {
+        const auto type_expected = device->GetCustomHeapProperties(node_mask, type_case.type);
+        for (const bool return_buffer_first : {false, true}) {
+            GuardedProperties output{{prefix, prefix}, {}, suffix};
+            void* first = return_buffer_first ? static_cast<void*>(&output.value) : device;
+            void* second = return_buffer_first ? device : static_cast<void*>(&output.value);
+            auto* returned = d3d12x_struct_return::get_custom_heap_properties(
+                first, second, node_mask, type_case.type, device);
+            const char* order = return_buffer_first ? "return_buffer_first" : "device_first";
+            if (returned != &output.value || output.before[0] != prefix ||
+                output.before[1] != prefix || output.after != suffix ||
+                std::memcmp(&output.value, &type_expected, sizeof(type_expected)) != 0) {
+                std::fprintf(stderr, "FAIL: struct_return %s %s: pointer, guards or properties differ "
+                             "from the desktop call\n", type_case.name, order);
+                return 1;
+            }
+            std::printf("struct_return %s %s: properties and guards match\n", type_case.name, order);
+        }
+    }
+
+    // Calls the adapter cannot resolve return nullptr and write nothing. Both buffers start
+    // with the device's vtable pointer, so only the address comparison tells them apart.
+    struct RejectCase {
+        const char* name;
+        int first;   // 0: nullptr, 1: device, 2: buffer a, 3: buffer b
+        int second;
+        bool pass_device;
+    };
+    constexpr RejectCase rejects[] = {
+        {"null_first", 0, 1, true},
+        {"null_second", 1, 0, true},
+        {"device_twice", 1, 1, true},
+        {"neither_is_device", 2, 3, true},
+        {"null_device", 2, 1, false},
+    };
+    for (const auto& reject : rejects) {
+        GuardedProperties a{{prefix, prefix}, {}, suffix};
+        GuardedProperties b{{prefix, prefix}, {}, suffix};
+        std::memcpy(&a.value, device, sizeof(void*));
+        std::memcpy(&b.value, device, sizeof(void*));
+        const GuardedProperties a_before = a;
+        const GuardedProperties b_before = b;
+        void* const candidates[] = {nullptr, device, &a.value, &b.value};
+        auto* returned = d3d12x_struct_return::get_custom_heap_properties(
+            candidates[reject.first], candidates[reject.second], node_mask, heap_type,
+            reject.pass_device ? device : nullptr);
+        if (returned) {
+            std::fprintf(stderr, "FAIL: struct_return reject %s: returned %p instead of nullptr\n",
+                         reject.name, static_cast<void*>(returned));
+            return 1;
+        }
+        if (std::memcmp(&a, &a_before, sizeof(a)) != 0 || std::memcmp(&b, &b_before, sizeof(b)) != 0) {
+            std::fprintf(stderr, "FAIL: struct_return reject %s: a candidate buffer changed\n",
+                         reject.name);
+            return 1;
+        }
+        std::printf("struct_return reject %s: nullptr, buffers unchanged\n", reject.name);
+    }
     return 0;
 }
 

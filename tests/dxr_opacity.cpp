@@ -29,14 +29,15 @@ static bool committed_mismatch(bool identity, bool candidateMatches, double dist
     return !identity || !candidateMatches || !matches(distance, wanted);
 }
 
-bool check_dxr_opacity(ID3D12Device* device, bool warp, bool usePipeline) {
+bool check_dxr_opacity(ID3D12Device* device, bool warp, bool usePipeline, float nearT) {
+    std::printf("dxr_opacity_tmin=%.9g\n", nearT);
     // The geometric reference must reproduce the hand-derived table on every
     // machine, including those that skip the GPU comparison.
     const auto scene = dxr_opacity::instances();
-    const auto probes = dxr_opacity::rays();
+    const auto probes = dxr_opacity::rays(nearT);
     const auto mesh = dxr_opacity::vertices();
     const auto flags = dxr_opacity::geometryFlags();
-    if (dxr_opacity::first_reference_mismatch() != probes.size())
+    if (dxr_opacity::first_reference_mismatch(probes) != probes.size())
         throw std::runtime_error("Opacity reference disagrees with its hand-derived table");
     if (committed_mismatch(true, true, 2.0, 2.0) || !committed_mismatch(true, true, 2.0 + 0.25, 2.0))
         throw std::runtime_error("Committed distance control failed to distinguish an injected TMin offset");

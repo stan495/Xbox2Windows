@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,9 @@ def check_aggregation_and_redaction(failures: list[str]) -> None:
             "fxc ps: /home/alice/secret/shader.hlsl(1,1): error X3000 at 0x00007ff712345678\n",
             encoding="utf-8",
         )
+        # A device slot 67 compute request with the same reason is counted in its own class.
+        (cache_dir / "0000000000000004.fail").write_text("image_load_mip tfe\n", encoding="utf-8")
+        (cache_dir / "req_0000000000000004.c67").write_bytes(b"\0" * 4)
 
         report = triage_run.triage_run(logdir, shader_cache=cache_dir, max_items=16)
 
@@ -72,6 +76,7 @@ def check_aggregation_and_redaction(failures: list[str]) -> None:
             "| 2 | `slot5` | `0x80004005` |",
             "| 1 | `persistent_local_storage` | `0x80070005` |",
             "| 2 | `image_load_mip tfe` |",
+            "| 1 | `compute: image_load_mip tfe` |",
             f"| 1 | `{triage_run.OTHER}` |",
         ]
         for snippet in expected_snippets:
@@ -188,6 +193,39 @@ def check_review_regressions(failures: list[str]) -> None:
         failures.append(f"failed/untraced slots missing from unhandled: {dict(unhandled)}")
 
 
+def check_every_slot70_reason_is_reported(failures: list[str]) -> None:
+    # Each reason the producer can log keeps its own row; none is folded into "other".
+    cases = [
+        ("unsupported memory SRV arguments", "null_destination"),
+        ("unsupported memory SRV arguments", "unreadable_resource"),
+        ("unsupported memory SRV arguments", "unreadable_view"),
+        ("unsupported memory SRV arguments", "null_address"),
+        ("unsupported memory SRV arguments", "unsupported_description"),
+        ("unsupported memory SRV arguments", "destination_outside_view_heaps"),
+        ("GPU-written resource at the supplied address", "gpu_written_resource"),
+        ("unavailable buffer at the supplied address", "buffer_unavailable"),
+        ("unavailable texture at the supplied base and layout", "texture_unavailable"),
+        ("unavailable texture at the supplied base and layout", "partial_tile_xg_rows"),
+        ("unavailable texture at the supplied base and layout", "partial_tile_beyond_xg_size"),
+        ("unavailable texture at the supplied base and layout", "unsupported_desktop_format"),
+        ("unavailable texture at the supplied base and layout", "console_layout_xg_rows"),
+        ("unavailable texture at the supplied base and layout", "console_layout_without_footprints"),
+        ("unavailable texture at the supplied base and layout", "console_layout_beyond_xg_size"),
+        ("unavailable texture at the supplied base and layout", "overlapping_resource"),
+    ]
+    reasons = [reason for _, reason in cases]
+    lines = [
+        f"x2w-d3d12 Device::slot70 {what}: reason={reason} "
+        "res{dim=3 fmt=98 size=128x128x2 mips=6 layout=0x105 flags=0x300000 align=65536 samples=1/0} "
+        "view{dim=5 fmt=98 map=0x1688} dest=0x1 dest_in_view_heap=1 address=0x2 address_readable=1\n"
+        for what, reason in cases
+    ]
+    refusals = triage_run.summarize_lines(lines)["slot70_refusals"]
+    reported = sorted(key[0] for key in refusals)
+    if reported != sorted(reasons):
+        failures.append(f"slot70 reasons reported as {reported}, expected {sorted(reasons)}")
+
+
 def check_empty_and_missing_dirs(failures: list[str]) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -201,6 +239,43 @@ def check_empty_and_missing_dirs(failures: list[str]) -> None:
                 failures.append(f"expected 0 scanned files for {target}")
             if "_None observed._" not in report:
                 failures.append(f"expected '_None observed._' for {target}")
+
+
+def check_slot133_outcomes(failures: list[str]) -> None:
+    # Device::slot133 logs every handled placement with a trailing "aliased|not aliased gpuva=..." field.
+    prefix = "x2w-d3d12 Device::slot133(CreatePlacedResourceX?) "
+    lines = [
+        prefix + "address=0x1000 base=0x1000 offset=0x0 width=0x100 flags=0x0 state=0x0 clear=0x0 riid=ID3D12Resource -> 0x00000000 aliased gpuva=0x2000\n",
+        prefix + "address=0x3000 base=0x3000 offset=0x0 width=0x100 flags=0x0 state=0x0 clear=0x0 riid=ID3D12Resource -> 0x00000000 not aliased gpuva=0x4000\n",
+        prefix + "address=0x5000 base=0x5000 offset=0x0 width=0x100 flags=0x0 state=0x0 clear=0x0 riid=ID3D12Resource -> 0x80070057 not aliased gpuva=0x0\n",
+        prefix + "texture address=0x6000 dim=3 64x64x1 mips=1 fmt=28 samples=1 flags=0x0 layout=0x0 state=0x0 clear=0x0 -> 0x00000000 not aliased []\n",
+        prefix + "address=0x7000 not committed -> E_INVALIDARG\n",
+        "x2w-d3d12 Device::slot15 not implemented\n",
+    ]
+    summary = triage_run.summarize_lines(lines)
+    outcomes = dict(summary["slot133_outcomes"])
+    if outcomes != {"aliased": 1, "not_aliased": 2, "failed": 2}:
+        failures.append(f"slot133 outcomes wrong: {outcomes}")
+    unhandled = dict(summary["d3d12_unhandled"])
+    if unhandled != {"Device::slot133": 2, "Device::slot15": 1}:
+        failures.append(f"slot133 successes counted as unhandled, or failures dropped: {unhandled}")
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "stderr.txt").write_text("".join(lines), encoding="utf-8")
+        report = triage_run.triage_run(Path(tmp))
+    if "| 2 | not_aliased |" not in report or "| 1 | aliased |" not in report or "| 2 | failed |" not in report:
+        failures.append("slot133 outcome table missing from the report:\n" + report)
+    if "gpuva" in report or "0x4000" in report:
+        failures.append("slot133 addresses leaked into the report:\n" + report)
+    # Control: with the old classification (no slot133 rule) the same log counts the successes as unhandled.
+    saved = (triage_run.RE_D3D12_SLOT133, triage_run.RE_D3D12_SLOT133_UNCOMMITTED)
+    never = re.compile(r"(?!)")
+    triage_run.RE_D3D12_SLOT133 = triage_run.RE_D3D12_SLOT133_UNCOMMITTED = never
+    try:
+        old = triage_run.summarize_lines(lines)["d3d12_unhandled"]
+    finally:
+        triage_run.RE_D3D12_SLOT133, triage_run.RE_D3D12_SLOT133_UNCOMMITTED = saved
+    if old.get("Device::slot133") != 5:
+        failures.append(f"control did not reproduce the old unhandled noise: {dict(old)}")
 
 
 def check_cli_invocation(failures: list[str]) -> None:
@@ -223,13 +298,232 @@ def check_cli_invocation(failures: list[str]) -> None:
             failures.append(f"CLI output missing expected row: {proc.stdout!r}")
 
 
+HEARTBEAT_FAILURES = (
+    "x2w-dstorage heartbeat {second} s: failed requests by cause read-at-or-past-eof={a} read-crossing-eof=0 "
+    "read-other={b} destination-capacity=3 destination-not-writable=0 zlib=11 bcpack=0 other=1\n"
+)
+HEARTBEAT_COMMIT = (
+    "x2w-dstorage heartbeat {second} s: requests done=10, commit peak={peak} MiB current={current} MiB, "
+    "live physical-page sections=4\n"
+)
+ENDPOINT_EVENTS = """\
+  0.120 module load C:\\Users\\alice\\secret\\game.exe base=0x00007ff700000000
+  1.500 exception 0x80000003 breakpoint at ntdll.dll+0x1234 first-chance params=[]
+  2.000 exception 0x406d1388 thread name at game.exe+0x10 first-chance params=['0x1']
+  250.250 exception 0xE06D7363 C++ exception at C:\\Users\\alice\\secret\\game.exe+0x55 first-chance params=['0x19930520', '0x00007ff7deadbeef']
+  299.900 exception 0xC0000005 access violation at KERNELBASE.dll+0x9000 second-chance params=['0x0', '0x00007ff7cafebabe']
+"""
+ENDPOINT_FORBIDDEN = [
+    "alice", "secret", "game.exe", "KERNELBASE", "ntdll", "deadbeef", "cafebabe", "0x19930520", "00007ff", "params",
+]
+
+
+def _endpoint_report(logs: dict[str, str]) -> str:
+    with tempfile.TemporaryDirectory() as tmp:
+        logdir = Path(tmp)
+        for name, text in logs.items():
+            (logdir / name).write_text(text, encoding="utf-8")
+        return triage_run.triage_run(logdir)
+
+
+def _check_endpoint_complete(failures: list[str]) -> None:
+    report = _endpoint_report(
+        {
+            "stderr.txt": HEARTBEAT_COMMIT.format(second=20, peak=900, current=800)
+            + HEARTBEAT_FAILURES.format(second=20, a=1, b=2)
+            + HEARTBEAT_COMMIT.format(second=290, peak=16208, current=15000)
+            + HEARTBEAT_COMMIT.format(second=299, peak=14000, current=13000)  # a lower peak after a higher one
+            + HEARTBEAT_FAILURES.format(second=299, a=7, b=9)
+            + HEARTBEAT_FAILURES.format(second=50, a=99, b=99),
+            "events.txt": ENDPOINT_EVENTS,
+        }
+    )
+    for want in [
+        "### Run End-Point",
+        "| Peak commit (maximum of the `commit peak=` values) | `16208` MiB |",
+        "| Last heartbeat | `299` s |",
+        "| Confirmed debugger stop | not reported |",
+        "| First observed exception | `0xe06d7363` (first-chance) |",
+        "| Last observed exception | `0xc0000005` (second-chance) |",
+        "| Observed exceptions | `2` |",
+        "at heartbeat second `299`",
+        "| read-at-or-past-eof | 7 |",
+        "| read-other | 9 |",
+        "| destination-capacity | 3 |",
+        "| zlib | 11 |",
+    ]:
+        if want not in report:
+            failures.append(f"run end-point: missing {want!r}\n{report}")
+    for secret in ENDPOINT_FORBIDDEN:
+        if secret in report:
+            failures.append(f"run end-point leaked {secret!r}")
+    for stepped_over in ("0x80000003", "0x406d1388"):
+        if stepped_over in report.lower():
+            failures.append(f"run end-point reported a stepped-over exception {stepped_over}")
+
+
+def _check_endpoint_without_commit(failures: list[str]) -> None:
+    report = _endpoint_report({"stderr.txt": HEARTBEAT_FAILURES.format(second=40, a=0, b=0)})
+    for want in [
+        "| Peak commit (maximum of the `commit peak=` values) | not reported |",
+        "| Last heartbeat | `40` s |",
+        "| Confirmed debugger stop | not reported |",
+        "| Observed exceptions | `0` |",
+        "at heartbeat second `40`",
+    ]:
+        if want not in report:
+            failures.append(f"run end-point without commit line: missing {want!r}")
+    report = _endpoint_report({"stderr.txt": "x2w-dstorage heartbeat 12 s: requests done=1, commit unknown, live physical-page sections=unknown\n"})
+    if "| Peak commit (maximum of the `commit peak=` values) | not reported |" not in report or "| Last heartbeat | `12` s |" not in report:
+        failures.append("run end-point: a 'commit unknown' heartbeat was not handled")
+    if "_No failed-requests-by-cause heartbeat line._" not in report:
+        failures.append("run end-point: missing the note for a run with no cause line")
+    report = _endpoint_report({})
+    if "| Last heartbeat | not reported |" not in report:
+        failures.append("run end-point: an empty run must report no heartbeat")
+
+
+def _check_endpoint_second_stop(failures: list[str]) -> None:
+    events = (
+        "  10.000 exception 0xC0000005 access violation at a.dll+0x1 first-chance params=[]\n"
+        "  11.000 exception 0xC0000005 access violation at a.dll+0x1 second-chance params=[]\n"
+        "debugger stop 0xc0000005 second-chance\n"
+    )
+    report = _endpoint_report({"events.txt": events})
+    for want in [
+        "| First observed exception | `0xc0000005` (first-chance) |",
+        "| Last observed exception | `0xc0000005` (second-chance) |",
+        "| Confirmed debugger stop | `0xc0000005` (second-chance) |",
+        "| Observed exceptions | `2` |",
+    ]:
+        if want not in report:
+            failures.append(f"run end-point with a second stop: missing {want!r}")
+
+
+def _check_endpoint_breakpoint(failures: list[str]) -> None:
+    events = (
+        "  1.000 exception 0x80000003 breakpoint at ntdll.dll+0x13 first-chance params=[]\n"
+        "  2.000 exception 0x80000003 breakpoint at app.exe+0x20 first-chance params=[]\n"
+    )
+    modern = _endpoint_report({"events.txt": events + "debugger stop 0x80000003 first-chance\n"})
+    legacy = _endpoint_report({
+        "events.txt": events,
+        "run.out": "stopped at breakpoint (0x80000003) at app.exe+0x20 after 2.00 s (first chance) params=[]\n",
+    })
+    unfinished = _endpoint_report({"events.txt": events})
+    for report in (modern, legacy):
+        if "| Confirmed debugger stop | `0x80000003` (first-chance) |" not in report:
+            failures.append("run end-point: stopping breakpoint was lost")
+        if "| Observed exceptions | `0` |" not in report or "app.exe" in report:
+            failures.append("run end-point: loader or assertion breakpoint details were counted or copied")
+    if "| Confirmed debugger stop | not reported |" not in unfinished:
+        failures.append("run end-point: first-chance event alone was classified as a stop")
+
+
+def _check_endpoint_private_lines(failures: list[str]) -> None:
+    hostile = (
+        "  5.000 exception 0xE06D7363deadbeef C++ exception at X first-chance params=[]\n"  # not a 32-bit code
+        "  6.000 exception 0xZZ00ZZ00 junk at Y second-chance\n"
+        "  7.000 exception 0xC0000005 at C:\\Users\\alice\\x.dll+0x1 [secret](https://acme.example/leak) second-chance\n"
+        "x2w-dstorage heartbeat 30 s: failed requests by cause read-other=5 acme_widget=99 zlib=0x7ff7deadbeef other=2\n"
+        "x2w-dstorage heartbeat 31 s: requests done=1, commit peak=0x00007ff7deadbeef MiB current=1 MiB, live physical-page sections=1\n"
+    )
+    report = _endpoint_report({"events.txt": hostile})
+    for needle in ["alice", "secret", "acme", "widget", "deadbeef", "leak", "http", "99 |"]:
+        if needle in report:
+            failures.append(f"run end-point copied hostile text {needle!r}\n{report}")
+    if "| Observed exceptions | `1` |" not in report or "`0xc0000005` (second-chance)" not in report:
+        failures.append("run end-point: only the well-formed 32-bit code should be reported")
+    if "| Peak commit (maximum of the `commit peak=` values) | not reported |" not in report:
+        failures.append("run end-point: a non-decimal peak must not be reported")
+
+
+def _endpoint_failures() -> list[str]:
+    failures: list[str] = []
+    for check in (
+        _check_endpoint_complete,
+        _check_endpoint_without_commit,
+        _check_endpoint_second_stop,
+        _check_endpoint_breakpoint,
+        _check_endpoint_private_lines,
+    ):
+        check(failures)
+    return failures
+
+
+def check_run_endpoint(failures: list[str]) -> None:
+    failures.extend(_endpoint_failures())
+    # Mutations: each wrong behaviour must make the end-point checks fail.
+    mutations = {
+        "peak taken from the last line instead of the maximum": ("_keep_peak", lambda old, new: new),
+        "an earlier cause line replaces a later one": ("_is_later_sample", lambda old, new: old is None),
+        "an out-of-order cause line replaces a later one": ("_is_later_sample", lambda old, new: True),
+        "the exception code is not limited to 32 bits": (
+            "RE_EXCEPTION",
+            re.compile(r"^\s*\d+\.\d+\s+exception\s+(0x[0-9a-fA-F]+)\b.*?\b(first|second)-chance\b"),
+        ),
+        "stepped-over exceptions are counted": ("FILTERED_FIRST_CHANCE", set()),
+    }
+    for label, (name, replacement) in mutations.items():
+        original = getattr(triage_run, name)
+        setattr(triage_run, name, replacement)
+        try:
+            caught = bool(_endpoint_failures())
+        finally:
+            setattr(triage_run, name, original)
+        if not caught:
+            failures.append(f"mutation not caught by the run end-point checks: {label}")
+
+def check_every_shader_reason_entry_is_reachable(failures: list[str]) -> None:
+    # Each table entry is a distinct report token. A pattern that can never match, or a label whose
+    # text changed, folds a known cause into "other" without failing anything else. The samples are
+    # matched back to the table so a new entry without a sample fails here.
+    samples = (
+        ("image_load_mip tfe", "image_load_mip tfe"),
+        ("image_load_mip a16", "image_load_mip a16"),
+        ("buffer_load_format_xyzw requires descriptor FORMAT and DST_SEL", "buffer_* instruction"),
+        ("SDWA UNUSED_SEXT", "SDWA UNUSED_SEXT"),
+        ("SDWA dst_unused:UNUSED_PRESERVE needs a tracked destination", "SDWA dst_unused"),
+        ("undecodable word at +0x10", "undecodable word"),
+        ("numeric use of s0 holding a descriptor", "numeric use of scalar register"),
+        ("operand v[0:3] is not a single register", "unsupported operand"),
+        ("modifier r128 is not lowered", "unsupported modifier"),
+        ("descriptor operand s[0:7]", "descriptor operand"),
+        ("sampler operand s[8:11]", "sampler operand"),
+        ("mask from descriptor data", "mask from descriptor data"),
+        ("s_load of 4 dwords from an unaligned address", "s_load form"),
+        ("v_mov_b32 SDWA sel_enc", "v_* SDWA form"),
+        ("v_mov_b32 with clamp", "v_* with modifier"),
+        ("v_mov_b32", "v_* instruction"),
+    )
+    covered: set[int] = set()
+    for line, expected in samples:
+        got = triage_run.classify_shader_reason(line)
+        if got != expected:
+            failures.append(f"classify_shader_reason({line!r}) -> {got!r}, expected {expected!r}")
+        for index, (pattern, _) in enumerate(triage_run.SHADER_REASONS):
+            if pattern.match(line):
+                covered.add(index)
+                break
+    missing = [index for index in range(len(triage_run.SHADER_REASONS)) if index not in covered]
+    for index in missing:
+        failures.append(
+            f"SHADER_REASONS[{index}] ({triage_run.SHADER_REASONS[index][0].pattern!r}) has no sample line"
+        )
+    if triage_run.classify_shader_reason("a reason nobody modelled") != triage_run.OTHER:
+        failures.append("an unmodelled reason did not fall back to the other token")
+
 def main() -> int:
     failures: list[str] = []
     check_aggregation_and_redaction(failures)
     check_private_text_never_echoed(failures)
     check_review_regressions(failures)
+    check_every_slot70_reason_is_reported(failures)
     check_empty_and_missing_dirs(failures)
     check_cli_invocation(failures)
+    check_slot133_outcomes(failures)
+    check_run_endpoint(failures)
+    check_every_shader_reason_entry_is_reachable(failures)
     for item in failures:
         print("FAIL", item)
     print(f"startup triage_run checks: {len(failures)} failed")

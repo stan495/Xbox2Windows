@@ -53,6 +53,25 @@ ARENA = Arena()
 CALL = ctypes.CFUNCTYPE(ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64)
 
 
+def plan_ranges(failures):
+    """plan_replacement refuses a site whose jmp rel32 fields would not fit.
+
+    Both offsets are computed from the site, the stub address and the moved bytes; with a site
+    more than 2 GiB away from the stub either field wraps, so the plan must be refused rather
+    than encoded.
+    """
+    # clzero (3 bytes) followed by two nops, so the 5-byte jmp has instructions to move.
+    code = bytes.fromhex("0f01fc9090")
+    near = 0x1000
+    plan = host_cpu.plan_replacement(code, near, 3, b"\x90" * 8, near + 0x100)
+    if plan is None:
+        failures.append("plan_replacement refused a near site")
+    # A site more than 2 GiB from the stub cannot be encoded as a rel32 jump. The second range
+    # check (the jump back from the moved instructions) needs a stub larger than 2 GiB to reach,
+    # so it stays uncovered rather than being asserted with an input no caller produces.
+    far = 0x7FFF0000_0000
+    if host_cpu.plan_replacement(code, far, 3, b"\x90" * 8, 0x1000) is not None:
+        failures.append("plan_replacement encoded an out-of-range forward offset")
 def build(before, instruction, after, stub=None, patch=True):
     """A function `PROLOGUE before instruction after`; with patch, the instruction is replaced."""
     code = PROLOGUE + before + instruction + after
@@ -123,11 +142,37 @@ def clzero_moves_rip_relative():
 
 # ---- INSERTQ / EXTRQ ----------------------------------------------------------------------------
 def movq_to_xmm(xmm, gpr):   # movq xmm, r64
-    return bytes([0x66, 0x48, 0x0F, 0x6E, 0xC0 | xmm << 3 | gpr])
+    rex = 0x48 | (4 if xmm >= 8 else 0) | (1 if gpr >= 8 else 0)
+    return bytes([0x66, rex, 0x0F, 0x6E, 0xC0 | (xmm & 7) << 3 | (gpr & 7)])
 
 
 def movq_from_xmm(xmm):      # movq rax, xmm
-    return bytes([0x66, 0x48, 0x0F, 0x7E, 0xC0 | xmm << 3])
+    rex = 0x48 | (4 if xmm >= 8 else 0)
+    return bytes([0x66, rex, 0x0F, 0x7E, 0xC0 | (xmm & 7) << 3])
+
+
+def movdqu_load(xmm, gpr):   # movdqu xmm, [r64]
+    rex = ([0x44] if xmm >= 8 else [])
+    return bytes([0xF3] + rex + [0x0F, 0x6F, (xmm & 7) << 3 | (gpr & 7)])
+
+
+def movdqu_store(gpr, xmm):  # movdqu [r64], xmm
+    rex = ([0x44] if xmm >= 8 else [])
+    return bytes([0xF3] + rex + [0x0F, 0x7F, (xmm & 7) << 3 | (gpr & 7)])
+
+
+def preserve_xmm(xmms):
+    """Prologue/epilogue saving and restoring unique XMM registers across a Windows x64 call."""
+    regs = sorted(set(xmms))
+    n = len(regs) * 16
+    save = bytes([0x48, 0x83, 0xEC, n])
+    restore = b""
+    for i, xmm in enumerate(regs):
+        rex = [0x44] if xmm >= 8 else []
+        modrm = 0x44 | (xmm & 7) << 3
+        save += bytes([0xF3] + rex + [0x0F, 0x7F, modrm, 0x24, i * 16])
+        restore += bytes([0xF3] + rex + [0x0F, 0x6F, modrm, 0x24, i * 16])
+    return save, restore + bytes([0x48, 0x83, 0xC4, n])
 
 
 def insertq_model(a, b, width, offset):
@@ -139,23 +184,46 @@ def extrq_model(a, width, offset):
     return a >> offset & ((1 << (width or 64)) - 1)
 
 
+def _rex_prefix(dest, src=0):
+    bits = (4 if dest >= 8 else 0) | (1 if src >= 8 else 0)
+    return bytes([0x40 | bits]) if bits else b""
+
+
 def insertq_function(dest, src, width, offset, patch=True, stub=None):
-    instruction = bytes([0xF2, 0x0F, 0x78, 0xC0 | dest << 3 | src, width, offset])
-    return build(movq_to_xmm(dest, 1) + movq_to_xmm(src, 2), instruction, movq_from_xmm(dest) + b"\xc3", stub, patch)
+    instruction = b"\xf2" + _rex_prefix(dest, src) + bytes([0x0F, 0x78, 0xC0 | (dest & 7) << 3 | (src & 7), width, offset])
+    save, restore = preserve_xmm((dest, src))
+    return build(save + movq_to_xmm(dest, 1) + movq_to_xmm(src, 2), instruction,
+                 movq_from_xmm(dest) + restore + b"\xc3", stub, patch)
 
 
-def extrq_function(dest, width, offset, patch=True):
-    instruction = bytes([0x66, 0x0F, 0x78, 0xC0 | dest, width, offset])
-    return build(movq_to_xmm(dest, 1), instruction, movq_from_xmm(dest) + b"\xc3", None, patch)
+def extrq_function(dest, width, offset, patch=True, stub=None):
+    instruction = b"\x66" + _rex_prefix(0, dest) + bytes([0x0F, 0x78, 0xC0 | (dest & 7), width, offset])
+    save, restore = preserve_xmm((dest,))
+    return build(save + movq_to_xmm(dest, 1), instruction, movq_from_xmm(dest) + restore + b"\xc3", stub, patch)
+
+
+def sse4a_128_function(instruction, dest, src, patch=True, stub=None):
+    """Run an SSE4a instruction on [rcx] (xmm_dest) and [rdx] (xmm_src), writing xmm_dest back to [rcx]."""
+    save, restore = preserve_xmm((dest, src))
+    before = save + movdqu_load(dest, 1) + (movdqu_load(src, 2) if src != dest else b"")
+    if src == dest and instruction[0] == 0xF2:
+        before = save + movdqu_load(dest, 2)
+    return build(before, instruction, movdqu_store(1, dest) + restore + b"\xc3", stub, patch)
 
 
 VALUES = [(0x0123456789ABCDEF, 0xFEDCBA9876543210), (M64, 0), (0, M64), (0x8000000000000001, 0x5555AAAA5555AAAA)]
-FIELDS = [(16, 16), (1, 0), (1, 63), (8, 56), (63, 1), (32, 0), (0, 0), (5, 11), (48, 16)]
+FIELDS = [(16, 16), (1, 0), (1, 63), (8, 56), (63, 1), (32, 0), (0, 0), (5, 11), (48, 16), (32, 32)]
+
+
+def _ctrl_word(width, offset, noise=0xCAFE00000000C0C0):
+    """Pack SSE4a register control word with non-zero ignored bits [7:6], [15:14], [63:16]."""
+    return (width & 0x3F) | ((offset & 0x3F) << 8) | (noise & ~0x3F3F)
 
 
 def sse4a_cases(native):
     checked = 0
-    for dest, src in ((0, 1), (1, 0), (3, 7), (7, 2), (5, 5)):
+    imm_pairs = ((0, 1), (1, 0), (3, 7), (7, 2), (5, 5), (0, 9), (8, 1), (9, 12), (15, 15))
+    for dest, src in imm_pairs:
         for width, offset in FIELDS:
             patched = insertq_function(dest, src, width, offset)
             original = insertq_function(dest, src, width, offset, patch=False) if native else None
@@ -168,7 +236,7 @@ def sse4a_cases(native):
                 if original:
                     assert original(a, b) == expected, f"native insertq differs from the model ({width}, {offset})"
                 checked += 1
-    for dest in (0, 4, 7):
+    for dest in (0, 4, 7, 8, 11, 15):
         for width, offset in FIELDS:
             patched = extrq_function(dest, width, offset)
             original = extrq_function(dest, width, offset, patch=False) if native else None
@@ -179,14 +247,96 @@ def sse4a_cases(native):
                 if original:
                     assert original(a, 0) == expected, f"native extrq differs from the model ({width}, {offset})"
                 checked += 1
+
+    # Immediate upper-64 preservation for REX and non-REX forms.
+    upper_sentinel = 0xCAFEBABE12345678
+    for insn, dest, src, is_insertq in (
+        (bytes.fromhex("f2450f78cc1010"), 9, 12, True),
+        (bytes.fromhex("66410f78c31010"), 11, 11, False),
+    ):
+        f = sse4a_128_function(insn, dest, src)
+        dst_buf = ctypes.create_string_buffer(struct.pack("<QQ", 0x0123456789ABCDEF, upper_sentinel), 16)
+        src_buf = ctypes.create_string_buffer(struct.pack("<QQ", 0xFEDCBA9876543210, 0x1111222233334444), 16)
+        f(ctypes.addressof(dst_buf), ctypes.addressof(src_buf))
+        out_lo, out_hi = struct.unpack("<QQ", dst_buf.raw)
+        expected_lo = (insertq_model(0x0123456789ABCDEF, 0xFEDCBA9876543210, 16, 16)
+                       if is_insertq else extrq_model(0x0123456789ABCDEF, 16, 16))
+        assert out_lo == expected_lo and out_hi == upper_sentinel, (hex(out_lo), hex(out_hi))
+        checked += 1
+
+    # Register-parameter forms (0F 79): INSERTQ xmm1, xmm2 and EXTRQ xmm1, xmm2.
+    reg_pairs = ((0, 1), (1, 0), (5, 5), (0, 9), (8, 1), (9, 12), (15, 15))
+    for dest, src in reg_pairs:
+        ins_code = b"\xf2" + _rex_prefix(dest, src) + bytes([0x0F, 0x79, 0xC0 | (dest & 7) << 3 | (src & 7)])
+        ext_code = b"\x66" + _rex_prefix(dest, src) + bytes([0x0F, 0x79, 0xC0 | (dest & 7) << 3 | (src & 7)])
+        ins_patched = sse4a_128_function(ins_code, dest, src)
+        ext_patched = sse4a_128_function(ext_code, dest, src)
+        ins_native = sse4a_128_function(ins_code, dest, src, patch=False) if native else None
+        ext_native = sse4a_128_function(ext_code, dest, src, patch=False) if native else None
+        for width, offset in FIELDS:
+            ctrl = _ctrl_word(width, offset)
+            for a, b in VALUES:
+                dst_in = b if dest == src else a
+                expected_ins = insertq_model(dst_in, b, width, offset)
+                dst_buf = ctypes.create_string_buffer(struct.pack("<QQ", a, upper_sentinel), 16)
+                src_buf = ctypes.create_string_buffer(struct.pack("<QQ", b, ctrl), 16)
+                ins_patched(ctypes.addressof(dst_buf), ctypes.addressof(src_buf))
+                out_lo, out_hi = struct.unpack("<QQ", dst_buf.raw)
+                exp_hi = ctrl if dest == src else upper_sentinel
+                assert out_lo == expected_ins and out_hi == exp_hi, (
+                    f"reg insertq xmm{dest}, xmm{src} ({width}, {offset}): {out_lo:#x}/{out_hi:#x}")
+                if ins_native:
+                    dst_buf_n = ctypes.create_string_buffer(struct.pack("<QQ", a, upper_sentinel), 16)
+                    ins_native(ctypes.addressof(dst_buf_n), ctypes.addressof(src_buf))
+                    nat_lo, _ = struct.unpack("<QQ", dst_buf_n.raw)
+                    assert nat_lo == expected_ins, f"native reg insertq differs ({width}, {offset})"
+                checked += 1
+
+                if dest == src:
+                    # EXTRQ xmm, xmm uses the same register for value and control (bits [13:8] and [5:0]).
+                    val = (a & ~0xFFFF) | ctrl & 0xFFFF
+                    expected_ext = extrq_model(val, width, offset)
+                    dst_buf = ctypes.create_string_buffer(struct.pack("<QQ", val, upper_sentinel), 16)
+                    src_buf = ctypes.create_string_buffer(struct.pack("<QQ", 0, 0), 16)
+                else:
+                    expected_ext = extrq_model(a, width, offset)
+                    dst_buf = ctypes.create_string_buffer(struct.pack("<QQ", a, upper_sentinel), 16)
+                    src_buf = ctypes.create_string_buffer(struct.pack("<QQ", ctrl, 0xBEEF000011112222), 16)
+                ext_patched(ctypes.addressof(dst_buf), ctypes.addressof(src_buf))
+                out_lo, out_hi = struct.unpack("<QQ", dst_buf.raw)
+                assert out_lo == expected_ext and out_hi == upper_sentinel, (
+                    f"reg extrq xmm{dest}, xmm{src} ({width}, {offset}): {out_lo:#x}/{out_hi:#x}")
+                if ext_native:
+                    dst_buf_n = ctypes.create_string_buffer(
+                        struct.pack("<QQ", val if dest == src else a, upper_sentinel), 16)
+                    ext_native(ctypes.addressof(dst_buf_n), ctypes.addressof(src_buf))
+                    nat_lo, _ = struct.unpack("<QQ", dst_buf_n.raw)
+                    assert nat_lo == expected_ext, f"native reg extrq differs ({width}, {offset})"
+                checked += 1
     return checked
 
 
-def insertq_keeps_registers_and_flags():
-    # movq xmm0, rcx; movq xmm1, rdx; stc | insertq xmm0, xmm1, 16, 16 | jnc bad; lea rax, [rcx + rdx]; ret; bad: ...
-    f = build(movq_to_xmm(0, 1) + movq_to_xmm(1, 2) + b"\xf9", bytes.fromhex("f20f78c11010"),
-              bytes.fromhex("7305488d0411c331c0c3"))
-    return f(0x1000, 0x234) == 0x1234
+def sse4a_keeps_registers_and_flags():
+    # Verify borrowed GPRs (rax, rcx, rdx, rsi, rdi) and CF stay intact across immediate/register stubs.
+    # push rsi; push rdi; mov rsi, 0x1111; mov rdi, 0x2222; mov rax, 0x3333; stc
+    # | <instruction> |
+    # jnc bad; cmp rax, 0x3333; jne bad; cmp rsi, 0x1111; jne bad; cmp rdi, 0x2222; jne bad;
+    # lea rax, [rcx + rdx]; jmp ok; bad: xor eax, eax; ok: pop rdi; pop rsi; ret
+    setup = bytes.fromhex("565748be111100000000000048bf222200000000000048b83333000000000000f9")
+    check = bytes.fromhex(
+        "731d483d3333000075164881fe11110000750d4881ff222200007504488d0411eb0231c05f5ec3"
+    )
+    for insn in (
+        bytes.fromhex("f20f78c11010"),     # insertq xmm0, xmm1, 16, 16
+        bytes.fromhex("f2450f78cc1010"),   # insertq xmm9, xmm12, 16, 16
+        bytes.fromhex("66410f78c31010"),   # extrq xmm11, 16, 16
+        bytes.fromhex("f2450f79cc"),       # insertq xmm9, xmm12
+        bytes.fromhex("66450f79cc"),       # extrq xmm9, xmm12
+    ):
+        f = build(setup, insn, check)
+        if f(0x1000, 0x234) != 0x1234:
+            return False
+    return True
 
 
 # ---- byte rewrites ------------------------------------------------------------------------------
@@ -242,12 +392,35 @@ def rewrites():
     assert host_cpu.wait_rewrite(b"\x0f\x01\xf9") is None and host_cpu.wait_rewrite(host_cpu.CLZERO) is None
 
     # Encodings the stubs do not cover are refused, not approximated.
-    assert host_cpu.sse4a_stub(bytes.fromhex("f20f78c12020")) is not None  # 32 bits at 32 is defined
+    for valid, wanted_len in (
+        (bytes.fromhex("f20f78c12020"), 6),    # 32 bits at 32 is defined
+        (bytes.fromhex("f2450f78cc2020"), 7),  # REX insertq xmm9, xmm12, 32, 32
+        (bytes.fromhex("66410f78c12020"), 7),  # REX extrq xmm9, 32, 32
+        (bytes.fromhex("f20f79c1"), 4),        # reg insertq xmm0, xmm1
+        (bytes.fromhex("f2450f79cc"), 5),      # REX reg insertq xmm9, xmm12
+        (bytes.fromhex("660f79c1"), 4),        # reg extrq xmm0, xmm1
+        (bytes.fromhex("66450f79cc"), 5),      # REX reg extrq xmm9, xmm12
+    ):
+        found = host_cpu.stub_for(valid)
+        assert found is not None and found[0] == wanted_len and host_cpu.sse4a_stub(valid) == found[1], valid.hex()
     for refused in (bytes.fromhex("f20f78c13030"),               # idx + len > 64
+                    bytes.fromhex("f2450f78cc3030"),             # REX idx + len > 64
+                    bytes.fromhex("66410f78c03030"),             # REX extrq idx + len > 64
                     bytes.fromhex("f20f78011010"),               # not a register operand
+                    bytes.fromhex("f2410f78011010"),             # REX mod != 3
+                    bytes.fromhex("660f7901"),                   # reg extrq mod != 3
+                    bytes.fromhex("f2410f7901"),                 # REX reg insertq mod != 3
                     bytes.fromhex("660f78c81010"),               # extrq with /1
-                    bytes.fromhex("f2410f78c110"),               # REX prefix (xmm8-15)
-                    bytes.fromhex("f20f79c1c3c3")):              # register-count form
+                    bytes.fromhex("66410f78c81010"),             # REX extrq with /1
+                    bytes.fromhex("f30f78c11010"),               # wrong prefix f3
+                    bytes.fromhex("f30f79c1"),                   # wrong prefix f3 on 0f 79
+                    bytes.fromhex("0f78c11010"),                 # missing prefix
+                    bytes.fromhex("0f79c1"),                     # missing prefix
+                    bytes.fromhex("41660f78c11010"),             # REX before 66
+                    bytes.fromhex("66f20f78c11010"),             # duplicate prefix
+                    bytes.fromhex("6641420f79c1"),               # duplicate REX
+                    bytes.fromhex("f2410f78c110"),               # truncated REX immediate
+                    bytes.fromhex("660f79")):                    # truncated reg form
         assert host_cpu.sse4a_stub(refused) is None and host_cpu.stub_for(refused) is None, refused.hex()
 
 
@@ -464,6 +637,10 @@ def main():
     features = host_features()
     rewrites()
 
+    planned = []
+    plan_ranges(planned)
+    assert not planned, "; ".join(planned)
+
     assert clzero_case(), "clzero stub"
     assert clzero_moves_rip_relative(), "an instruction moved behind the clzero stub lost its rip-relative operand"
     if "clzero" in features:
@@ -475,12 +652,21 @@ def main():
     assert not clzero_case(long), "a 72-byte clzero stub passed"
 
     checked = sse4a_cases("sse4a" in features)
-    assert insertq_keeps_registers_and_flags(), "insertq stub changed rcx, rdx or CF"
-    # Negative control: the stub for a field 8 bits further along must not pass as this one.
+    assert sse4a_keeps_registers_and_flags(), "sse4a stub changed GPRs or CF"
+    # Negative controls: wrong bit-offset or wrong-register stubs must not pass.
     wrong = host_cpu.sse4a_stub(bytes.fromhex("f20f78c11018"))
     mutant = insertq_function(0, 1, 16, 16, stub=wrong)
     a, b = VALUES[0]
     assert mutant(a, b) != insertq_model(a, b, 16, 16), "a stub for another bit offset passed"
+    wrong_rex_reg = host_cpu.sse4a_stub(bytes.fromhex("f2450f78c41010"))  # xmm8, xmm12 instead of xmm9, xmm12
+    mutant_rex = insertq_function(9, 12, 16, 16, stub=wrong_rex_reg)
+    assert mutant_rex(a, b) != insertq_model(a, b, 16, 16), "a REX stub for another register passed"
+    wrong_reg_form = host_cpu.sse4a_stub(bytes.fromhex("66450f79c9"))  # extrq xmm9, xmm9 instead of xmm9, xmm12
+    mutant_reg = sse4a_128_function(bytes.fromhex("66450f79cc"), 9, 12, stub=wrong_reg_form)
+    dst_m = ctypes.create_string_buffer(struct.pack("<QQ", a, 0), 16)
+    src_m = ctypes.create_string_buffer(struct.pack("<QQ", _ctrl_word(16, 16), 0), 16)
+    mutant_reg(ctypes.addressof(dst_m), ctypes.addressof(src_m))
+    assert struct.unpack("<Q", dst_m.raw[:8])[0] != extrq_model(a, 16, 16), "a 0F 79 stub for wrong registers passed"
 
     stores, rdpid_registers = more_rewrites(features)
     digests, native_sha = sha_cases("sha" in features)

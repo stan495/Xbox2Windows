@@ -43,7 +43,9 @@ DWORD WINAPI output_window_thread(void* ready)
     RegisterClassW(&cls);
     RECT area{0, 0, 1600, 900};
     AdjustWindowRect(&area, WS_OVERLAPPEDWINDOW, FALSE);
-    output_handle = CreateWindowExW(0, cls.lpszClassName, L"Xbox2Windows - output", WS_OVERLAPPEDWINDOW, 60, 60,
+    wchar_t title[80];  // 22 fixed characters and the revision (at most 46)
+    swprintf(title, 80, L"Xbox2Windows %ls - output", x2w_build_rev_w);
+    output_handle = CreateWindowExW(0, cls.lpszClassName, title, WS_OVERLAPPEDWINDOW, 60, 60,
                                     area.right - area.left, area.bottom - area.top, nullptr, nullptr, cls.hInstance, nullptr);
     if (output_handle) ShowWindow(output_handle, SW_SHOWNOACTIVATE);
     SetEvent(static_cast<HANDLE>(ready));

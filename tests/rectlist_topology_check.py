@@ -138,6 +138,13 @@ class RectlistTopologyTests(unittest.TestCase):
         self.assertEqual(triangles[4], v2)
         self.assertEqual(triangles[5], [-1.0, 1.0])
 
+        # validate_winding=True refuses the clockwise order (v2, v1, v0);
+        # without the flag the same corners still expand.
+        with self.assertRaises(ValueError) as ctx:
+            expand_rectangles([v2, v1, v0], validate_winding=True)
+        self.assertIn("counter-clockwise winding precondition", str(ctx.exception))
+        self.assertEqual(len(expand_rectangles([v2, v1, v0])), 6)
+
     def test_expand_rectangles_multiple(self):
         rects = [
             [-1.0, -1.0], [1.0, -1.0], [1.0, 1.0],  # Rect 0
@@ -145,10 +152,23 @@ class RectlistTopologyTests(unittest.TestCase):
         ]
         expanded = expand_rectangles(rects)
         self.assertEqual(len(expanded), 12)
+        # Rect 1 reads its own corners 3..5; v3 = (-0.5, -0.5) + (0.5, 0.5) - (0.5, -0.5).
+        self.assertEqual(
+            expanded[6:],
+            [
+                [-0.5, -0.5], [0.5, -0.5], [0.5, 0.5],
+                [-0.5, -0.5], [0.5, 0.5], [-0.5, 0.5],
+            ],
+        )
 
     def test_expand_indices(self):
         indices = expand_indices(2)
         self.assertEqual(indices, [0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7])
+        # base_vertex offsets every index: rect i starts at 8 + 4 * i.
+        self.assertEqual(
+            expand_indices(2, base_vertex=8),
+            [8, 9, 10, 8, 10, 11, 12, 13, 14, 12, 14, 15],
+        )
 
     def test_raster_oracle_fullscreen(self):
         oracle = rect_raster_oracle([((-1.0, -1.0), (1.0, 1.0))], 32, 32)
@@ -174,6 +194,14 @@ class RectlistTopologyTests(unittest.TestCase):
         # Exactly 16 x 16 = 256 pixels in quadrant
         self.assertEqual(fg_count, 256)
         self.assertEqual(bg_count, 768)
+        # Row 0 is the top (+y) and column 0 the left (-x) edge, so the quadrant
+        # covers x >= 16, y < 16: x = 16 has x_ndc = 33 / 32 - 1 = 1 / 32 and
+        # y = 15 has y_ndc = 1 - 31 / 32 = 1 / 32; x = 15 and y = 16 fall at -1 / 32.
+        for y in range(32):
+            for x in range(32):
+                expected = fg if x >= 16 and y < 16 else bg
+                offset = (y * 32 + x) * 4
+                self.assertEqual(oracle[offset : offset + 4], expected, (x, y))
 
     def test_raster_oracle_mutant_detection(self):
         baseline = rect_raster_oracle([((0.0, 0.0), (1.0, 1.0))], 16, 16)

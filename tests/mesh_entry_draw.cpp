@@ -118,11 +118,18 @@ bool check_mesh_draw(ID3D12Device* device, const char* first, const char* second
     }
     constexpr UINT side = 32;
     constexpr UINT cb_bytes = 512;
-    const UINT trace_stride = fallback ? 128 : 80;
     constexpr UINT image_bytes = side * side * 4;
     constexpr UINT texel_bytes = 2 * 2 * 4;
     const auto input = read_bytes(fixture);
     const UINT draw_bytes = 2 * cb_bytes + (vertices ? 512 : 0);
+    UINT trace_stride = fallback ? 128 : 80;
+    if (mode == MeshDrawMode::multi_primitive) {
+        // Counts, 128 float4 positions and 128 uint3 indices fit in 3,600 bytes.
+        if (fallback || vertices || input.size() < draw_bytes + image_bytes + 80 ||
+            input.size() > draw_bytes + image_bytes + 3600 || (input.size() - draw_bytes - image_bytes) % 16)
+            throw std::runtime_error("Invalid multi-primitive draw fixture");
+        trace_stride = static_cast<UINT>(input.size() - draw_bytes - image_bytes);
+    }
     const bool textured = mode == MeshDrawMode::textured;
     const bool depth_pair = mode == MeshDrawMode::depth_pair;
     const auto depth_format = depth_pair ? DXGI_FORMAT_D32_FLOAT : DXGI_FORMAT_UNKNOWN;

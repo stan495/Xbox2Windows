@@ -39,10 +39,17 @@ REQUIRED_IMPLEMENTED_FUNCTIONS = {
     "XSystemGetConsoleId",
     "XSystemGetDeviceType",
     "XGameGetXboxTitleId",
+    "XUserAddAsync",
+    "XUserAddResult",
+    "XGameSaveInitializeProviderAsync",
+    "XGameSaveInitializeProviderResult",
+    "XAsyncGetStatus",
+    "XAsyncGetResultSize",
+    "XTaskQueueCreate",
+    "XTaskQueueDispatch",
+    "XTaskQueueCloseHandle",
 }
 REQUIRED_STUBS = {
-    "XUserAddAsync",
-    "XGameSaveInitializeProviderAsync",
     "XPackageMountWithUiAsync",
 }
 STATES = {"stub", "implemented_hr", "implemented_void", "implemented_value"}

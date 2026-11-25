@@ -34,6 +34,25 @@ def program(op, words, *, packed="0x3e01", quad=True):
     ] + tail(reference="v7")
 
 
+def pcf_program(words, *, packed="0x3e01"):
+    """Two comparison taps on the one bound depth texture, averaged: a two-tap PCF."""
+    lines = ["s_mov_b64 s[50:51], exec", "s_wqm_b64 exec, exec", *prefix(), "s_and_b64 exec, exec, s[50:51]"]
+    return lines + sampler_moves(words) + [
+        "v_mov_b32_e32 v7, s60",
+        f"v_mov_b32_e32 v6, {packed}",
+        "image_sample_c_lz v12, v[7:9], s[28:35], s[40:43] dmask:0x1 dim:SQ_RSRC_IMG_2D",
+        "image_sample_c_lz_o v16, v[6:9], s[28:35], s[40:43] dmask:0x1 dim:SQ_RSRC_IMG_2D",
+        "s_waitcnt vmcnt(0)",
+        "v_add_f32_e32 v12, v12, v16",
+        "v_mul_f32_e32 v12, 0.5, v12",
+        "v_add_f32_e32 v13, 0, v7",
+        "v_mov_b32_e32 v14, 0.5",
+        "v_mov_b32_e32 v15, 1.0",
+        "exp mrt0 v12, v13, v14, v15 done vm",
+        "s_endpgm",
+    ]
+
+
 def must_reject(function, diagnostic):
     try:
         function()
@@ -65,13 +84,18 @@ def controls():
         ):
             lines = [line.replace(old, new) for line in program(op, words)]
             must_reject(lambda: translate(lines, words), reason)
+    hlsl = translate(pcf_program(words), words)
+    assert hlsl.count("tex.SampleCmpLevelZero(samp, float2(uv.x, uv.y),") == 2, hlsl
+    assert hlsl.count(", int2(1, -2))") == 1, hlsl
+    # A tap that overwrites the other tap before the wait is still refused.
+    early = [line.replace("v16, v[6:9]", "v12, v[6:9]") for line in pcf_program(words)]
+    must_reject(lambda: translate(early, words), "outstanding sample")
 
 
 def binary(directory, assembler, objcopy, library):
     words = sampler_words("LESS", "point")
     features = "+wavefrontsize64,-wavefrontsize32"
-    for op in FORMS:
-        lines = program(op, words)
+    for lines in (*(program(op, words) for op in FORMS), pcf_program(words)):
         code = assemble(directory, assembler, objcopy, lines, cpu="gfx1030", features=features)
         decoded = pixel_aot.disassemble(code, library, cpu=b"gfx1030", features=features.encode(), offsets=True)
         assert [line for _, line in decoded if line.startswith("image_")] == [
@@ -104,13 +128,18 @@ def reference(px, py, size, mode, displacement):
                      for dx, wx in ((0, 1 - fx), (1, fx)) for dy, wy in ((0, 1 - fy), (1, fy))))
 
 
-def write_case(path, size, mode, displacement):
+def pcf_reference(px, py, size, mode):
+    return 0.5 * (reference(px, py, size, mode, (0, 0)) + reference(px, py, size, mode, OFFSET))
+
+
+def write_case(path, size, mode, displacement, model=None):
+    model = model or (lambda x, y: reference(x, y, size, mode, displacement))
     data = bytearray(struct.pack("<6I", D3D12_FILTER[mode], 2, TEXTURE, TEXTURE, size, size))
     data.extend(struct.pack("<64f", CONSTANT_REFERENCE, *([0.0] * 63)))
     data.extend(struct.pack(f"<{len(DEPTHS)}f", *DEPTHS))
     for y in range(size):
         for x in range(size):
-            data.extend(struct.pack("<4f", reference(x, y, size, mode, displacement), CONSTANT_REFERENCE, 0.5, 1.0))
+            data.extend(struct.pack("<4f", model(x, y), CONSTANT_REFERENCE, 0.5, 1.0))
     path.write_bytes(data)
 
 
@@ -139,7 +168,38 @@ def draw(directory, compiler, renderer, adapter):
                     else:
                         assert result.returncode == 0, (result.stdout, result.stderr)
                     print(result.stdout, end="")
+    draw_pcf(directory, compiler, renderer, adapter)
     write_record(os.environ.get("FORM_COVERAGE_RECORD"))
+
+
+def draw_pcf(directory, compiler, renderer, adapter):
+    # Pass: the average of the unshifted and offset taps. Controls: the same shader against the
+    # one-tap expectation, and a shader whose second tap lost its offset, must both mismatch.
+    for mode in ("point", "bilinear"):
+        words = sampler_words("LESS", mode)
+        for mutant in (False, True):
+            source = directory / f"pcf-{mode}-{mutant}.hlsl"
+            shader = source.with_suffix(".cso")
+            source.write_text(translate(pcf_program(words, packed="0" if mutant else "0x3e01"), words),
+                              encoding="ascii")
+            compile_shader(compiler, source, shader)
+            for size in (8, 16):
+                models = [("pcf", lambda x, y: pcf_reference(x, y, size, mode))]
+                if not mutant:
+                    models.append(("one tap", lambda x, y: reference(x, y, size, mode, (0, 0))))
+                for name, model in models:
+                    case = source.with_suffix(".case")
+                    write_case(case, size, mode, (0, 0), model)
+                    result = run_case(renderer, adapter, shader, case)
+                    if result == 77:
+                        raise SystemExit(77)
+                    if mutant or name != "pcf":
+                        assert result.returncode == 1 and "pixel_mismatch" in result.stderr, (result.stdout, result.stderr)
+                        label = "second tap without offset" if mutant else "one-tap expectation"
+                        print(f"pcf {mode} size={size} {label}: {result.stderr.strip().splitlines()[0]}")
+                    else:
+                        assert result.returncode == 0, (result.stdout, result.stderr)
+                        print(f"pcf {mode} size={size}: " + result.stdout, end="")
 
 
 if __name__ == "__main__":
@@ -149,4 +209,4 @@ if __name__ == "__main__":
         out.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="compare-sample-", dir=out) as directory:
             {"binary": binary, "draw": draw}[sys.argv[1]](Path(directory), *sys.argv[2:])
-    print("Three gfx1030 2D comparison sample forms checked")
+    print("Three gfx1030 2D comparison sample forms and a two-tap PCF checked")

@@ -7,7 +7,8 @@ Each fixture is a source-built gfx1013 pixel stage that sets v0 = 0.5, v1 = 0.25
 constant comparison sampler in s[24:27] (point filtering, clamp, one SQ_TEX_DEPTH_COMPARE function) and runs one
 image instruction on a texture from descriptor table 0. The address dwords of a comparison are the reference, then
 u and v, so the contiguous form v[0:2] compares v0 against the texel at (v1, v2) and the NSA form [v3, v0, v1]
-compares v3 at (v0, v1): the lowering must follow the position, not the register number. The sampler is declared
+compares v3 at (v0, v1): the lowering must follow the position, not the register number. A 2D array (dim:SQ_RSRC_IMG_2D_ARRAY)
+adds the slice as a fourth address register and becomes a Texture2DArray compared at float3(u, v, slice). The sampler is declared
 as a SamplerComparisonState and listed as an smpc manifest line, even where its words equal an ordinary sampler's.
 
 HLSL has no SampleCmpLevel before shader model 6.7, so image_sample_c_l is refused, as are the forms and
@@ -60,13 +61,19 @@ IMAGE = {
     'dmask3': 'image_sample_c_lz v[4:6], v[0:2], s[16:23], s[24:27] dmask:0x7 dim:SQ_RSRC_IMG_2D',
     'dmask2': 'image_sample_c_lz v4, v[0:2], s[16:23], s[24:27] dmask:0x2 dim:SQ_RSRC_IMG_2D',
     'array': 'image_sample_c_lz v4, v[0:3], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D_ARRAY',
+    'array_nsa': 'image_sample_c_lz v4, [v3, v0, v1, v2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D_ARRAY',
+    'array_c': 'image_sample_c v4, v[0:3], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D_ARRAY',
+    'array_c_l': 'image_sample_c_l v4, v[0:4], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D_ARRAY',
+    'array_dmask3': 'image_sample_c_lz v[4:6], v[0:3], s[16:23], s[24:27] dmask:0x7 dim:SQ_RSRC_IMG_2D_ARRAY',
+    'array_offset': 'image_sample_c_lz_o v4, v[0:4], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D_ARRAY',
+    'array_unorm': 'image_sample_c_lz v4, v[0:3], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D_ARRAY unorm',
     'three': 'image_sample_c_lz v4, v[0:3], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_3D',
     'cube': 'image_sample_c_lz v4, v[0:3], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_CUBE',
     'dim1d': 'image_sample_c_lz v4, v[0:1], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_1D',
     'offset': 'image_sample_c_lz_o v4, v[0:3], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D',
     'bias': 'image_sample_c_b v4, v[0:3], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D',
     'clamp': 'image_sample_c_cl v4, v[0:3], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D',
-    'gather': 'image_gather4_c_lz v[4:7], v[0:2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D',
+    'gather': 'image_gather4_c v[4:7], v[0:2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D',
     'a16': 'image_sample_c_lz v4, v[0:1], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D a16',
     'tfe': 'image_sample_c_lz v[4:5], v[0:2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D tfe',
     'unorm': 'image_sample_c_lz v4, v[0:2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm',
@@ -77,7 +84,7 @@ IMAGE = {
 # SQ_IMG_SAMP_WORD1 bits 23:12 are MAX_LOD (4.8 fixed point). The translated static sampler never limits the
 # LOD, so an implicit comparison is lowered only when the source limits it to level zero.
 MAX_LOD_FULL = 0xfff << 12
-W1 = {'c': MAX_LOD_FULL, 'c_nsa': MAX_LOD_FULL, 'c_max_partial': 1 << 12}
+W1 = {'c': MAX_LOD_FULL, 'c_nsa': MAX_LOD_FULL, 'c_max_partial': 1 << 12, 'array_c_full': MAX_LOD_FULL}
 # name -> (image key, sampler word 0, sampler word 2)
 VARIANTS = {name: (name, POINT | LESS, 0) for name in IMAGE}
 VARIANTS.update({'func%d' % n: ('lz', POINT | n << 12, 0) for n in range(8) if n != 1})
@@ -89,6 +96,7 @@ VARIANTS['wrap_x'] = ('lz', (POINT | LESS) & ~7, 0)
 VARIANTS['mixed'] = ('mixed', POINT | LESS, 0)
 VARIANTS['c_max0'] = ('c', POINT | LESS, 0)
 VARIANTS['c_max_partial'] = ('c', POINT | LESS, 0)
+VARIANTS['array_c_full'] = ('array_c', POINT | LESS, 0)
 WORDS = {
     'lz': bytes.fromhex(
         '04040cf4000000faff0398be12100008800399be80039abe80039bbef002007e'
@@ -138,6 +146,34 @@ WORDS = {
         '04040cf4000000faff0398be12100008800399be80039abe80039bbef002007e'
         'ff02027e0000803ef202047ef402067e7fc08cbf2801bcf00004c400703f8cbf'
         '0f1800f804040404000081bf'),
+    'array_nsa': bytes.fromhex(
+        '04040cf4000000faff0398be12100008800399be80039abe80039bbef002007e'
+        'ff02027e0000803ef202047ef402067e7fc08cbf2a01bcf00304c40000010200'
+        '703f8cbf0f1800f804040404000081bf'),
+    'array_c': bytes.fromhex(
+        '04040cf4000000faff0398be12100008800399be80039abe80039bbef002007e'
+        'ff02027e0000803ef202047ef402067e7fc08cbf2801a0f00004c400703f8cbf'
+        '0f1800f804040404000081bf'),
+    'array_c_l': bytes.fromhex(
+        '04040cf4000000faff0398be12100008800399be80039abe80039bbef002007e'
+        'ff02027e0000803ef202047ef402067e7fc08cbf2801b0f00004c400703f8cbf'
+        '0f1800f804040404000081bf'),
+    'array_dmask3': bytes.fromhex(
+        '04040cf4000000faff0398be12100008800399be80039abe80039bbef002007e'
+        'ff02027e0000803ef202047ef402067e7fc08cbf2807bcf00004c400703f8cbf'
+        '0f1800f804040404000081bf'),
+    'array_offset': bytes.fromhex(
+        '04040cf4000000faff0398be12100008800399be80039abe80039bbef002007e'
+        'ff02027e0000803ef202047ef402067e7fc08cbf2801fcf00004c400703f8cbf'
+        '0f1800f804040404000081bf'),
+    'array_unorm': bytes.fromhex(
+        '04040cf4000000faff0398be12100008800399be80039abe80039bbef002007e'
+        'ff02027e0000803ef202047ef402067e7fc08cbf2811bcf00004c400703f8cbf'
+        '0f1800f804040404000081bf'),
+    'array_c_full': bytes.fromhex(
+        '04040cf4000000faff0398be12100008ff0399be00f0ff0080039abe80039bbe'
+        'f002007eff02027e0000803ef202047ef402067e7fc08cbf2801a0f00004c400'
+        '703f8cbf0f1800f804040404000081bf'),
     'three': bytes.fromhex(
         '04040cf4000000faff0398be12100008800399be80039abe80039bbef002007e'
         'ff02027e0000803ef202047ef402067e7fc08cbf1001bcf00004c400703f8cbf'
@@ -164,7 +200,7 @@ WORDS = {
         '0f1800f804040404000081bf'),
     'gather': bytes.fromhex(
         '04040cf4000000faff0398be12100008800399be80039abe80039bbef002007e'
-        'ff02027e0000803ef202047ef402067e7fc08cbf08013cf10004c400703f8cbf'
+        'ff02027e0000803ef202047ef402067e7fc08cbf080120f10004c400703f8cbf'
         '0f1800f804040404000081bf'),
     'a16': bytes.fromhex(
         '04040cf4000000faff0398be12100008800399be80039abe80039bbef002007e'
@@ -291,6 +327,7 @@ def refused(name, text):
         raise AssertionError('%s was accepted' % name)
 
 
+ARRAY_CALL = re.compile(r'v4 = U\((r\d+)\.(SampleCmp(?:LevelZero)?)\((q\d+), float3\(F\((v\d+)\), F\((v\d+)\), F\((v\d+)\)\), F\((v\d+)\)\)\);')
 CALL = re.compile(r'v4 = U\((r\d+)\.(SampleCmp(?:LevelZero)?)\((q\d+), float2\(F\((v\d+)\), F\((v\d+)\)\), F\((v\d+)\)\)\);')
 
 
@@ -309,6 +346,15 @@ def check_call(ps, method, u, v, reference, declaration='SamplerComparisonState 
     assert declaration in ps, ps
 
 
+def check_array_call(ps, u, v, slice_, reference, declaration='Texture2DArray<float4> r0 : register(t0);'):
+    """The exact Texture2DArray comparison a 2D-array lowering must produce: the slice is the third location component."""
+    calls = ARRAY_CALL.findall(ps)
+    assert len(calls) == 1, ps
+    _texture, method, _sampler, got_u, got_v, got_slice, got_reference = calls[0]
+    assert (method, got_u, got_v, got_slice, got_reference) == ('SampleCmpLevelZero', u, v, slice_, reference), calls
+    assert declaration in ps and 'SamplerComparisonState q0 : register(s0);' in ps, ps
+
+
 def manifest_samplers(pipe):
     return [line for line in pipe.manifest().splitlines() if line.startswith(('smp ', 'smpc '))]
 
@@ -325,6 +371,16 @@ def controls():
     refused('c_max_partial', 'implicit mip selection')
     assert 'Texture2D<float4> r0' in lz.hlsl_ps() and 'srv 0 tex2d table 0 0' in lz.manifest()
     assert manifest_samplers(lz) == ['smpc 0 0x%x 0x0 0x0 0x0' % (POINT | LESS)], manifest_samplers(lz)
+    # A 2D array adds the slice as the last address register and binds a Texture2DArray (manifest kind tex2da).
+    array = pipeline('array')
+    check_array_call(array.hlsl_ps(), 'v1', 'v2', 'v3', 'v0')
+    assert 'srv 0 tex2da table 0 0' in array.manifest(), array.manifest()
+    assert manifest_samplers(array) == ['smpc 0 0x%x 0x0 0x0 0x0' % (POINT | LESS)], manifest_samplers(array)
+    check_array_call(pipeline('array_nsa').hlsl_ps(), 'v0', 'v1', 'v2', 'v3')  # NSA: reference v3, slice v2
+    check_array_call(pipeline('array_c').hlsl_ps(), 'v1', 'v2', 'v3', 'v0')
+    refused('array_c_full', 'implicit mip selection')
+    refused('array_c_l', 'shader model 6.7')
+    print('array: reference v0 at (v1, v2, slice v3); NSA reference v3, slice v2; Texture2DArray bound; implicit c needs MAX_LOD 0')
     print('lz: reference v0 at (v1, v2); NSA reference v3 at (v0, v1); implicit c refused; sampler smpc')
 
     # The comparison function travels in word 0 bits 14:12, one function per fixture.
@@ -352,12 +408,15 @@ def controls():
     refused('c_l_nsa', 'shader model 6.7')
     refused('dmask3', 'dmask 0x7')
     refused('dmask2', 'dmask 0x2')
-    for name, dim in (('array', '2D_ARRAY'), ('three', '3D'), ('cube', 'CUBE'), ('dim1d', '1D')):
+    for name, dim in (('three', '3D'), ('cube', 'CUBE'), ('dim1d', '1D')):
         refused(name, 'image_sample_c_lz on SQ_RSRC_IMG_' + dim)
+    refused('array_offset', 'image_sample_c_lz_o')
+    refused('array_dmask3', 'dmask 0x7')
+    refused('array_unorm', 'image_sample_c_lz modifier unorm')
     refused('offset', 'image_sample_c_lz_o')
     refused('bias', 'image_sample_c_b')
     refused('clamp', 'image_sample_c_cl')
-    refused('gather', 'image_gather4_c_lz')
+    refused('gather', 'image_gather4_c')
     for name in ('a16', 'tfe', 'unorm', 'lwe', 'd16', 'r128'):
         refused(name, 'image_sample_c_lz modifier %s' % name)
     for name in RESERVED:
@@ -366,7 +425,7 @@ def controls():
     refused('wrap_x', 'sampler: Comparison sampling requires CLAMP_LAST_TEXEL')
     refused('anisotropic', 'sampler: Comparison sampling with anisotropy')
     refused('point_no_trunc', 'sampler: Comparison sampling with point filtering requires TRUNC_COORD 1')
-    print('refused: c_l, extra dmask channels, array/3D/cube/1D, offset/bias/clamp/gather, '
+    print('refused: c_l, extra dmask channels, 3D/cube/1D, offset/bias/clamp/gather, '
           'a16/tfe/unorm/lwe/d16/r128, reserved bits, samplers outside the checked profile')
 
 
@@ -397,6 +456,25 @@ def negative_controls():
             print('mutant fails the exact call check:', label)
         else:
             raise AssertionError('mutant passed: ' + label)
+    arr = pipeline('array').hlsl_ps()
+    arr_want = ('v1', 'v2', 'v3', 'v0')
+    array_mutants = (
+        ('slice dropped (a 2D location)', arr.replace('float3(F(v1), F(v2), F(v3))', 'float2(F(v1), F(v2))')),
+        ('slice read from the reference register', arr.replace('F(v2), F(v3))', 'F(v2), F(v0))')),
+        ('slice read from v2 instead of the fourth register', arr.replace('F(v2), F(v3))', 'F(v2), F(v2))')),
+        ('slice and v exchanged', arr.replace('F(v1), F(v2), F(v3)', 'F(v1), F(v3), F(v2)')),
+        ('reference swapped with u', arr.replace('F(v1), F(v2), F(v3)), F(v0)', 'F(v0), F(v2), F(v3)), F(v1)')),
+        ('plain Texture2D declared', arr.replace('Texture2DArray<float4>', 'Texture2D<float4>')),
+        ('SampleCmp instead of SampleCmpLevelZero', arr.replace('SampleCmpLevelZero', 'SampleCmp')),
+    )
+    for label, text in array_mutants:
+        assert text != arr, label
+        try:
+            check_array_call(text, *arr_want)
+        except AssertionError:
+            print('array mutant fails the exact call check:', label)
+        else:
+            raise AssertionError('array mutant passed: ' + label)
     # A wrong comparison function is a different manifest word: each function has its own smpc line.
     lines = [manifest_samplers(pipeline('lz' if n == 1 else 'func%d' % n)) for n in range(8)]
     assert all(lines[n] != lines[m] for n in range(8) for m in range(8) if n != m), lines

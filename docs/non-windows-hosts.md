@@ -82,6 +82,7 @@ LLVM_LIB="$LLVM_PREFIX/lib/libLLVM-15.dylib" \
 ## Quick start on Linux
 
 The [CI workflow](../.github/workflows/windows.yml) runs the platform-independent Python suite on Ubuntu 24.04 with Python 3.12 (`python-linux`) and the `gfx1013` machine-code checks on Ubuntu 22.04 with LLVM 15 (`pixel-binary`).
+Both jobs use `tools/run_checks_parallel.py`; the machine-code matrix supplies per-check LLVM arguments and environment overrides.
 
 On Debian/Ubuntu, install `python3-venv` first. Without it, `python3 -m venv` fails with `ensurepip is not available`:
 
@@ -167,6 +168,20 @@ python3 -B tests/pixel_fp32_vulkan_check.py /path/to/dxc /path/to/vkrunner
 ```
 
 The probe checks finite output bits, signed zero, infinities, and NaN class through a compute buffer. A second dispatch uses an intentionally incorrect underflow rounding rule and must fail the same comparison. Repeat `--device <index>` to test specific one-based VkRunner device indices. The fixture exercises the desktop helpers through SPIR-V. Pixel shader lowering and D3D12 readback have their own tests.
+
+## Optional Vulkan subnormal check
+
+With the Linux build of DXC, `spirv-val` and `spirv-dis` from SPIRV-Tools, a C compiler, the Vulkan loader headers and a Vulkan 1.2 device, check whether the driver keeps binary32 subnormals in a source-built pixel shader. [`tests/vk_pixel_draw.c`](../tests/vk_pixel_draw.c) is a small Vulkan host that draws a full-screen triangle with a compiled vertex and pixel shader, 256 bytes of constants and an RGBA32F or RGBA32UI target, and writes the raw pixels to a file. The check builds it when you pass the `.c` file.
+
+```bash
+python3 -B tests/pixel_denorm_vulkan_check.py /path/to/dxc tests/vk_pixel_draw.c --device Intel
+```
+
+`--device` is a substring of the Vulkan device name (repeat it for several adapters), and `VK_DRIVER_FILES` selects a driver such as lavapipe. To build the host once and reuse it, run `cc -std=c11 -O1 -o out/vk/vk_pixel_draw tests/vk_pixel_draw.c -lvulkan` and pass `out/vk/vk_pixel_draw` instead of the `.c` file.
+
+A `ps_6_2` pixel shader runs seven operations whose inputs or results are binary32 subnormals and writes each result word to its own RGBA32UI pixel. DXC compiles it with `-spirv -fspv-target-env=vulkan1.2 -fvk-b-shift 0 0 -fvk-t-shift 16 0 -fvk-s-shift 32 0 -fvk-u-shift 48 0`. The words read back must equal IEEE binary32 arithmetic computed in Python under `-denorm preserve`. The same shader compiled with `-denorm ftz` is the negative control and must differ, otherwise the check fails because it cannot tell preserve from flush. The log lists the device, driver, DXC and SPIRV-Tools versions, the SPIR-V execution mode, every word read back for both modes and the cases where the control differs.
+
+A device that reports `shaderDenormPreserveFloat32` as false is a capability skip (exit code 77). A module that `spirv-val` rejects or that the driver refuses to build is a validation refusal (exit code 78). Neither counts as a mismatch, and a mismatch exits with 1. A refusal that follows a `preserve` readback that differs from IEEE (for example, `-denorm ftz` refused) is still a mismatch and exits with 1, because 78 means a refusal with no measured mismatch. Run without arguments, `python3 -B tests/pixel_denorm_vulkan_check.py` needs no device, DXC or SPIR-V tools: it checks the classification of the two readbacks (preserve mismatch with an FTZ refusal, an FTZ control that matches preserve, and the nominal cases), and the Linux Python checks job runs it.
 
 ## Expected CMake failure and no-stub policy
 

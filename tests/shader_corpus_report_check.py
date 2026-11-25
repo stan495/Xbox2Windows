@@ -214,6 +214,75 @@ class CorpusReportChecks(unittest.TestCase):
             self.assertEqual(compute["decode_failures"], 1)
             self.assertEqual(compute["decoded_dwords"], 2)
 
+    def test_unsupported_forms_split_encoding_and_rank(self):
+        def unsupported(code):
+            forms = {
+                P1_CODE: ("V_ADD_F32_DPP v1, v2", "v_mov_b32_sdwa v0, v1", "s_nop 0", "   "),
+                C1_CODE: ("v_add_f32_dpp v3, v4", "v_cmp_eq_u32_e64 s[0:1], v0, v1",
+                          "v_cmp_eq_u32_e64 s[2:3], v2, v3"),
+                V1_CODE: ("v_mov_b32_sdwa v2, v3",),
+            }[code]
+            return DecodeResult(2, 2, forms)
+
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "fixture.archive"
+            archive.write_bytes(fixture_archive())
+            document = build_document(archive, decoder=unsupported)
+            corpus = document["sections"]["shader_corpus"]
+            # The pixel stream backs 3 records; compute and vertex back 1 each.
+            # The mixed-case DPP form merges with the compute one, and the blank
+            # entry is skipped. Rows rank by blocked streams, then instructions
+            # (v_cmp has 2 in one stream, s_nop 1), then form name (v_add < v_mov).
+            self.assertEqual(corpus["unsupported"]["forms"], [
+                {"form": "v_add_f32_dpp", "family": "v_add_f32", "encoding": "dpp",
+                 "stages": ["pixel", "compute"], "blocked_streams": 2, "blocked_records": 4,
+                 "instructions": 2},
+                {"form": "v_mov_b32_sdwa", "family": "v_mov_b32", "encoding": "sdwa",
+                 "stages": ["pixel", "vertex"], "blocked_streams": 2, "blocked_records": 4,
+                 "instructions": 2},
+                {"form": "v_cmp_eq_u32_e64", "family": "v_cmp_eq_u32", "encoding": "e64",
+                 "stages": ["compute"], "blocked_streams": 1, "blocked_records": 1,
+                 "instructions": 2},
+                {"form": "s_nop", "family": "s_nop", "encoding": "plain",
+                 "stages": ["pixel"], "blocked_streams": 1, "blocked_records": 3,
+                 "instructions": 1},
+            ])
+            self.assertIn("| 1 | `v_add_f32_dpp` | `v_add_f32` | dpp | pixel, compute | 2 | 4 | 2 |",
+                          render_markdown(document))
+
+    def test_invalid_decoder_results_are_failures(self):
+        def invalid(code):
+            return {
+                P1_CODE: DecodeResult(-1, 2),
+                C1_CODE: DecodeResult(1, 3),  # each stream holds 2 code dwords
+                V1_CODE: DecodeResult(True, 2),
+            }[code]
+
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "fixture.archive"
+            archive.write_bytes(fixture_archive())
+            corpus = build_document(archive, decoder=invalid)["sections"]["shader_corpus"]
+            self.assertEqual(corpus["decode"], {"status": "failed", "streams": 3, "failures": 3})
+            self.assertEqual(corpus["first_failures"], [
+                {"stage": "pixel", "reason": "ValueError: invalid instruction count", "streams": 1},
+                {"stage": "vertex", "reason": "ValueError: invalid instruction count", "streams": 1},
+                {"stage": "compute", "reason": "ValueError: invalid decoded dword count", "streams": 1},
+            ])
+            self.assertEqual(corpus["totals"]["decoded_dwords"], 0)
+            self.assertEqual(corpus["totals"]["instructions"], 0)
+
+            def raising(code):
+                if code == V1_CODE:
+                    raise RuntimeError("owned callback stop")
+                return DecodeResult(2, 2)
+
+            corpus = build_document(archive, decoder=raising)["sections"]["shader_corpus"]
+            self.assertEqual(corpus["decode"], {"status": "partial", "streams": 3, "failures": 1})
+            self.assertEqual(corpus["first_failures"], [
+                {"stage": "vertex", "reason": "RuntimeError: owned callback stop", "streams": 1}
+            ])
+            self.assertEqual(corpus["totals"]["instructions"], 4)
+
     def test_negative_control_and_empty_archive(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

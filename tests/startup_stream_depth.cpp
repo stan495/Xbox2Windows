@@ -94,7 +94,7 @@ int pick_adapter(bool hardware, ComPtr<IDXGIAdapter>& adapter)
 
 void* create_stream_pso(void* device, ID3D12RootSignature* root, const std::vector<char>& vs,
                         const std::vector<char>& ps, const D3D12_DEPTH_STENCIL_DESC& ds, bool use_ds1,
-                        BOOL depth_bounds = FALSE)
+                        BOOL depth_bounds = FALSE, DXGI_FORMAT dsv_format = DXGI_FORMAT_D32_FLOAT)
 {
     using CreateStream = HRESULT (WINAPI*)(void*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
     auto create = reinterpret_cast<CreateStream>((*static_cast<void***>(device))[86]);
@@ -105,7 +105,7 @@ void* create_stream_pso(void* device, ID3D12RootSignature* root, const std::vect
             {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root},
             {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {vs.data(), vs.size()}},
             {static_cast<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE>(21), ds, depth_bounds},
-            {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT_D32_FLOAT},
+            {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, dsv_format},
         };
         const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
         if (FAILED(create(device, &desc, __uuidof(ID3D12PipelineState), &pso))) return nullptr;
@@ -115,7 +115,7 @@ void* create_stream_pso(void* device, ID3D12RootSignature* root, const std::vect
             {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root},
             {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {vs.data(), vs.size()}},
             {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, ds},
-            {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT_D32_FLOAT},
+            {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, dsv_format},
         };
         const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
         if (FAILED(create(device, &desc, __uuidof(ID3D12PipelineState), &pso))) return nullptr;
@@ -162,6 +162,46 @@ int clear_depth_desktop(ID3D12Device* desktop, ID3D12Resource* depth_tex)
     return ok ? 0 : 45;
 }
 
+// Clears the depth to 1 and the stencil to `value` on the desktop device, as clear_depth_desktop does for depth only.
+int clear_stencil_desktop(ID3D12Device* desktop, ID3D12Resource* tex, UINT8 value)
+{
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    if (FAILED(desktop->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)))) return 40;
+    const D3D12_DEPTH_STENCIL_VIEW_DESC view{DXGI_FORMAT_D24_UNORM_S8_UINT, D3D12_DSV_DIMENSION_TEXTURE2D, D3D12_DSV_FLAG_NONE, {}};
+    const D3D12_CPU_DESCRIPTOR_HANDLE handle = heap->GetCPUDescriptorHandleForHeapStart();
+    desktop->CreateDepthStencilView(tex, &view, handle);
+
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    ComPtr<ID3D12CommandQueue> queue;
+    ComPtr<ID3D12CommandAllocator> alloc;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    ComPtr<ID3D12Fence> fence;
+    if (FAILED(desktop->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))) ||
+        FAILED(desktop->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
+        FAILED(desktop->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list))) ||
+        FAILED(desktop->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) return 41;
+
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition = {tex, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE};
+    list->ResourceBarrier(1, &b);
+    list->ClearDepthStencilView(handle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, value, 0, nullptr);
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    list->ResourceBarrier(1, &b);
+    if (FAILED(list->Close())) return 42;
+
+    ID3D12CommandList* lists[] = {list.Get()};
+    queue->ExecuteCommandLists(1, lists);
+    if (FAILED(queue->Signal(fence.Get(), 1))) return 43;
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!ev) return 44;
+    const bool ok = SUCCEEDED(fence->SetEventOnCompletion(1, ev)) && WaitForSingleObject(ev, 10000) == WAIT_OBJECT_0;
+    CloseHandle(ev);
+    return ok ? 0 : 45;
+}
+
 int execute_guest_list(void* queue, void* list, void* fence, UINT64 fence_value)
 {
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 50;
@@ -177,7 +217,7 @@ int execute_guest_list(void* queue, void* list, void* fence, UINT64 fence_value)
 
 int main(int argc, char** argv)
 {
-    if (argc != 8 && argc != 15) return 2;
+    if (argc != 8 && argc != 19) return 2;
     std::vector<char> vs_front, vs_back, ps_green, ps_red, ps_empty;
     if (!read_bytes(argv[1], vs_front) || !read_bytes(argv[2], vs_back) ||
         !read_bytes(argv[3], ps_green) || !read_bytes(argv[4], ps_red) || !read_bytes(argv[7], ps_empty)) return 3;
@@ -225,7 +265,20 @@ int main(int argc, char** argv)
     void* pso_front_depth_only = create_stream_pso(guest, root, vs_front, ps_empty, ds_less, true);
     // DepthBoundsTestEnable has no translated equivalent: the pipeline is refused for drawing, not translated without it.
     void* pso_front_bounds = create_stream_pso(guest, root, vs_front, ps_green, ds_less, true, TRUE);
-    if (!pso_front_bounds || !pso_front_less || !pso_back_less || !pso_front_off || !pso_back_off || !pso_front_depth_only) return 9;
+    // Stencil test only: a pixel passes when the stored stencil equals the reference set with OMSetStencilRef (slot 24).
+    D3D12_DEPTH_STENCIL_DESC ds_stencil{};
+    ds_stencil.DepthEnable = FALSE;
+    ds_stencil.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    ds_stencil.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    ds_stencil.StencilEnable = TRUE;
+    ds_stencil.StencilReadMask = 0xFF;
+    ds_stencil.StencilWriteMask = 0;
+    ds_stencil.FrontFace = ds_stencil.BackFace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                                                  D3D12_COMPARISON_FUNC_EQUAL};
+    void* pso_front_stencil = create_stream_pso(guest, root, vs_front, ps_green, ds_stencil, false, FALSE,
+                                                DXGI_FORMAT_D24_UNORM_S8_UINT);
+    if (!pso_front_bounds || !pso_front_less || !pso_back_less || !pso_front_off || !pso_back_off || !pso_front_depth_only ||
+        !pso_front_stencil) return 9;
     if (argc == 8) return 0;
 
     ComPtr<ID3D12Device> desktop;
@@ -253,9 +306,12 @@ int main(int argc, char** argv)
     if (FAILED(desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &dsv_tex_desc,
             D3D12_RESOURCE_STATE_COMMON, &dsv_clear, IID_PPV_ARGS(&depth_tex)))) return 21;
 
+    const D3D12_RESOURCE_DESC stencil_tex_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1,
+        DXGI_FORMAT_D24_UNORM_S8_UINT, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL};
+
     const struct { D3D12_DESCRIPTOR_HEAP_DESC desc; Word backing, bytes; }
         rtv_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1}, 0, 0},
-        dsv_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2}, 0, 0};
+        dsv_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 3}, 0, 0};
     void* dsv_heap = nullptr;
     if (FAILED(static_cast<HRESULT>(invoke(guest, 14, ptr_arg(&rtv_heap_desc), ptr_arg(&__uuidof(ID3D12DescriptorHeap)), ptr_arg(&state.rtv_heap)))) ||
         FAILED(static_cast<HRESULT>(invoke(guest, 14, ptr_arg(&dsv_heap_desc), ptr_arg(&__uuidof(ID3D12DescriptorHeap)), ptr_arg(&dsv_heap))))) return 22;
@@ -271,6 +327,9 @@ int main(int argc, char** argv)
     const D3D12_DEPTH_STENCIL_VIEW_DESC dsv_read_only_view{DXGI_FORMAT_D32_FLOAT, D3D12_DSV_DIMENSION_TEXTURE2D,
         D3D12_DSV_FLAG_READ_ONLY_DEPTH, {}};
     invoke(guest, 21, ptr_arg(depth_tex.Get()), ptr_arg(&dsv_read_only_view), dsv_read_only.ptr);
+    const D3D12_CPU_DESCRIPTOR_HANDLE dsv_stencil{dsv_read_only.ptr + desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV)};
+    const D3D12_DEPTH_STENCIL_VIEW_DESC dsv_stencil_view{DXGI_FORMAT_D24_UNORM_S8_UINT, D3D12_DSV_DIMENSION_TEXTURE2D,
+        D3D12_DSV_FLAG_NONE, {}};
 
     D3D12_COMMAND_QUEUE_DESC qd{};
     const unsigned list_desc[] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
@@ -322,5 +381,37 @@ int main(int argc, char** argv)
     if (const int rc = run_case(5, argv[12], Bind::rtv_as_depth, pso_front_less, pso_back_less)) return rc;
     if (const int rc = run_case(6, argv[13], Bind::dsv_as_target, pso_front_less, pso_back_less)) return rc;
     if (const int rc = run_case(7, argv[14], Bind::normal, pso_front_bounds, pso_front_bounds)) return rc;
+
+    // OMSetStencilRef (slot 24): the stencil is cleared to `stored`, the pipeline passes where it equals the
+    // reference. A pixel is drawn only if the reference reached the desktop list. `closed_call` sets a reference
+    // on the list after it was closed, which must be ignored.
+    auto run_stencil_case = [&](UINT64 fence_val, const char* out_path, UINT8 stored, UINT reference, bool closed_call) -> int {
+        // Each case clears to its own value without producing a diagnostic about a mismatched optimized clear.
+        ComPtr<ID3D12Resource> stencil_tex;
+        D3D12_CLEAR_VALUE stencil_clear{};
+        stencil_clear.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        stencil_clear.DepthStencil = {1.0f, stored};
+        if (FAILED(desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &stencil_tex_desc,
+                D3D12_RESOURCE_STATE_COMMON, &stencil_clear, IID_PPV_ARGS(&stencil_tex)))) return 21;
+        invoke(guest, 21, ptr_arg(stencil_tex.Get()), ptr_arg(&dsv_stencil_view), dsv_stencil.ptr);
+        if (const int rc = clear_stencil_desktop(desktop.Get(), stencil_tex.Get(), stored)) return rc;
+        if (FAILED(static_cast<HRESULT>(invoke(state.allocator, 8)))) return 24;
+        if (FAILED(static_cast<HRESULT>(invoke(state.list, 139, ptr_arg(state.allocator))))) return 25;
+        invoke(state.list, 52, rtv.ptr, ptr_arg(clear_color));
+        invoke(state.list, 21, 1, ptr_arg(&viewport));
+        invoke(state.list, 22, 1, ptr_arg(&rect));
+        invoke(state.list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        invoke(state.list, 50, 1, ptr_arg(&rtv), FALSE, ptr_arg(&dsv_stencil));
+        invoke(state.list, 25, ptr_arg(pso_front_stencil));
+        invoke(state.list, 24, reference);
+        invoke(state.list, 12, 3, 1);
+        if (const int rc = execute_guest_list(state.queue, state.list, state.fence, fence_val)) return rc;
+        if (closed_call) invoke(state.list, 24, 0x33);
+        return read_stream_target(desktop.Get(), state, out_path);
+    };
+    if (const int rc = run_stencil_case(8, argv[15], 0x5A, 0x5A, true)) return rc;   // equal: drawn
+    if (const int rc = run_stencil_case(9, argv[16], 0x5A, 0x5B, false)) return rc;  // unequal: not drawn
+    if (const int rc = run_stencil_case(10, argv[17], 0x00, 0x00, false)) return rc; // zero: drawn
+    if (const int rc = run_stencil_case(11, argv[18], 0xFF, 0xFF, false)) return rc; // 0xFF: drawn
     return 0;
 }

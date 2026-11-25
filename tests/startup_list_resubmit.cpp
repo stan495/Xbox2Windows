@@ -15,6 +15,8 @@
 //      submit A again                    green
 //   6. A on a, submit, Reset allocator a red    the earlier allocator, now idle, is reused: two
 //      desktop allocators behind a; A on it, clear blue, submit                   blue
+//   7. Fail Close on a compute list whose earlier submission is still queued. Reject a mismatched
+//      allocator, then recover with the correct allocator and complete both valid submissions.
 //
 //   startup_list_resubmit <warp|hardware> untracked   (also X2W_TEST_SUBMIT_FENCE_FAIL=1)
 //
@@ -92,12 +94,12 @@ struct Probe {
         return true;
     }
     // Errors and corruption messages the D3D12 debug layer stored for the device.
-    UINT64 debug_errors()
+    UINT64 debug_errors(UINT64 first = 0)
     {
         ComPtr<ID3D12InfoQueue> info;
         if (FAILED(desktop.As(&info))) return 0;
         UINT64 errors = 0;
-        for (UINT64 i = 0, n = info->GetNumStoredMessages(); i < n; ++i) {
+        for (UINT64 i = first, n = info->GetNumStoredMessages(); i < n; ++i) {
             SIZE_T bytes = 0;
             if (FAILED(info->GetMessage(i, nullptr, &bytes))) continue;
             std::vector<char> storage(bytes);
@@ -276,5 +278,56 @@ int main(int argc, char** argv)
     const UINT64 errors = probe.debug_errors();
     std::printf("device removed reason: 0x%08lx, debug layer errors: %llu\n", static_cast<unsigned long>(removed),
                 static_cast<unsigned long long>(errors));
-    return removed == S_OK && errors == 0 ? 0 : 70;
+    if (removed != S_OK || errors != 0) return 70;
+
+    // Use a real desktop recording error: a COMPUTE list cannot set a viewport.
+    // Keep the earlier valid submit behind a queue wait during the replacement.
+    const unsigned compute_desc[] = {D3D12_COMMAND_LIST_TYPE_COMPUTE, 2, 1, 0};
+    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    void *compute = nullptr, *compute_a = nullptr, *compute_b = nullptr;
+    if (!ok(invoke(device, 9, compute_desc[0], arg(&__uuidof(ID3D12CommandAllocator)), arg(&compute_a))) ||
+        !ok(invoke(device, 9, compute_desc[0], arg(&__uuidof(ID3D12CommandAllocator)), arg(&compute_b))) ||
+        !ok(invoke(device, 73, arg(compute_desc), arg(compute_a), 0, arg(&__uuidof(ID3D12GraphicsCommandList)), arg(&compute))) ||
+        !ok(invoke(device, 8, arg(&queue_desc), arg(&__uuidof(ID3D12CommandQueue)), arg(&probe.queue)))) return 71;
+    void* compute_gate = make_fence(device);
+    if (!compute_gate || !ok(invoke(probe.queue, 17, arg(compute_gate), 1)) ||
+        !ok(invoke(compute, 139, arg(compute_a))) || !ok(invoke(compute, 9)) || !probe.submit(compute, false)) return 72;
+
+    if (!ok(invoke(compute, 139, arg(compute_b)))) return 73;
+    const D3D12_VIEWPORT viewport{0, 0, 1, 1, 0, 1};
+    invoke(compute, 21, 1, arg(&viewport));
+    const auto bad_close = static_cast<HRESULT>(invoke(compute, 9));
+    const auto bad_reset = static_cast<HRESULT>(invoke(compute, 139, arg(a)));
+    std::printf("7 failed Close: 0x%08lx, wrong-type Reset: 0x%08lx\n",
+                static_cast<unsigned long>(bad_close), static_cast<unsigned long>(bad_reset));
+    if (SUCCEEDED(bad_close) || bad_reset != E_INVALIDARG) {
+        invoke(compute_gate, 10, 1);
+        return 74;
+    }
+
+    ComPtr<ID3D12InfoQueue> info;
+    probe.desktop.As(&info);
+    const UINT64 expected_fault_messages = info ? info->GetNumStoredMessages() : 0;
+    if (!probe.submit(compute, false)) return 75; // The failed recording is dropped by the queue wrapper.
+    const auto recovered_reset = static_cast<HRESULT>(invoke(compute, 139, arg(compute_b)));
+    const auto recovered_close = static_cast<HRESULT>(invoke(compute, 9));
+    const unsigned compute_b_pool = x2w_d3d12_allocator_pool_size(compute_b);
+    std::printf("7 recovered Reset: 0x%08lx, Close: 0x%08lx, desktop allocators behind compute_b: %u (expected 2)\n",
+                static_cast<unsigned long>(recovered_reset), static_cast<unsigned long>(recovered_close),
+                compute_b_pool);
+    if (FAILED(recovered_reset) || FAILED(recovered_close) || compute_b_pool != 2 || !probe.submit(compute, false))
+        return 76;
+    if (invoke(probe.fence, 8) >= probe.fence_value ||
+        !ok(invoke(compute_gate, 10, 1)) || !probe.reached()) return 78;
+    // Once the failed list is released, Reset on compute_b reuses the retired desktop allocator instead of growing.
+    if (!ok(invoke(compute_b, 8))) return 80;
+    const unsigned compute_b_reused = x2w_d3d12_allocator_pool_size(compute_b);
+    std::printf("7 after compute_b Reset, desktop allocators behind compute_b: %u (expected 2)\n", compute_b_reused);
+    if (compute_b_reused != 2 || !ok(invoke(compute, 139, arg(compute_b))) || !ok(invoke(compute, 9)) ||
+        !probe.submit(compute))
+        return 81;
+    const auto remaining_errors = probe.debug_errors(expected_fault_messages);
+    std::printf("7 device removed reason after recovery: 0x%08lx, unexpected debug layer errors: %llu\n",
+                static_cast<unsigned long>(probe.desktop->GetDeviceRemovedReason()), remaining_errors);
+    return probe.desktop->GetDeviceRemovedReason() == S_OK && remaining_errors == 0 ? 0 : 79;
 }

@@ -2,6 +2,8 @@
 import argparse
 from pathlib import Path
 
+import pefile
+
 from ffx_version_query import INTEGER_HEADER, LOADER, checked_image, export_body, lower
 
 
@@ -65,11 +67,18 @@ def generate(path):
                           "r8 = reinterpret_cast<word>(allocator);"])
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("loader", type=Path)
     parser.add_argument("output", type=Path)
-    args = parser.parse_args()
-    if args.output.suffix.lower() != ".cpp" or args.output.resolve() == args.loader.resolve():
-        parser.error("choose a separate .cpp output")
-    args.output.write_text(generate(args.loader), encoding="ascii")
+    args = parser.parse_args(argv)
+    try:
+        if args.output.suffix.lower() != ".cpp" or args.output.resolve() == args.loader.resolve():
+            parser.error("choose a separate .cpp output")
+        args.output.write_text(generate(args.loader), encoding="ascii")
+    except (OSError, ValueError, pefile.PEFormatError) as error:
+        parser.exit(1, f"{error}\n")
+
+
+if __name__ == "__main__":
+    main()

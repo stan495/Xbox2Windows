@@ -40,6 +40,13 @@ class HostCommitChecks(unittest.TestCase):
             require_commit_budget(33, exact)
         self.assertEqual(snapshot_from_pages(2, 3, MIB)["available_bytes"], 0)
         self.assertEqual(snapshot_from_pages(3, 2, 4096)["available_mib"], 0)
+        # 384 and 192 pages of 4 KiB are 1.5 and 0.75 MiB: headroom is 0.75 MiB, so it
+        # floors to 0 MiB, not to the 1 MiB difference of the floored limit and use.
+        partial = snapshot_from_pages(384, 192, 4096)
+        self.assertEqual(partial, dict(limit_mib=1, used_mib=0, available_mib=0,
+                                       available_bytes=192 * 4096))
+        with self.assertRaisesRegex(ValueError, "headroom 0 MiB is below the requested 1 MiB"):
+            require_commit_budget(1, partial)
         for args in ((0, 0, 4096), (1, 0, 0)):
             with self.assertRaisesRegex(ValueError, "invalid commit"):
                 snapshot_from_pages(*args)
@@ -51,6 +58,11 @@ class HostCommitChecks(unittest.TestCase):
         for invalid in (-1, 1 << 20 | 1, "64", 1.25):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 require_commit_budget(invalid, snapshot)
+        # The range check alone refuses 1 MiB past the cap, even with headroom for it.
+        huge = snapshot_from_pages((1 << 20) + 1, 0, MIB)
+        self.assertEqual(require_commit_budget(1 << 20, huge)["minimum_mib"], 1 << 20)
+        with self.assertRaisesRegex(ValueError, "between 0 and 1048576"):
+            require_commit_budget((1 << 20) + 1, huge)
 
     def test_native_layout_and_winapi_arguments(self):
         native = NativeGetPerformance()

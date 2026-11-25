@@ -16,10 +16,15 @@ access and carry DIR64 relocations, the null entry has none, the load-config fie
 hold the relocated in-image targets on read-only pages.
 
 Windows replaces both slots of a /guard:cf image and ends a call to the invalid target before it writes
-output. pe_map currently does not implement CFG: it keeps the image's own slots, so the valid callback runs
-without the slot bits and the invalid target runs. The unchecked invalid result is recorded as an
-observation. The test also accepts an explicit unsupported-CFG diagnostic before dispatch. An unrelated
-load failure or a missing output record does not establish CFG behavior.
+output, when CFG is enforced for the process. A child inherits the host's CFG setting, and with system CFG
+off the loader keeps the image's own slots. The two /guard:cf images are therefore started with an explicit
+per-process policy: CFG always on for the assertions above, and CFG always off as a negative control that
+must give the result of the same objects linked without /guard:cf. Each child's effective
+EnableControlFlowGuard bit is checked against the requested policy. pe_map currently does not implement CFG:
+it keeps the image's own slots, so the valid callback runs without the slot bits and the invalid target
+runs. The unchecked invalid result is recorded as an observation. The test also accepts an explicit
+unsupported-CFG diagnostic before dispatch. An unrelated load failure or a missing output record does not
+establish CFG behavior.
 """
 import ctypes
 from ctypes import wintypes
@@ -34,7 +39,7 @@ from tempfile import TemporaryDirectory
 
 import pefile
 
-from exe_process import launch
+from exe_process import launch, thread_ids
 from native_map_check import Mapper, STATUS
 
 IO = "cpu_exe_io.dll"
@@ -43,6 +48,112 @@ GUARD_CF = 0x4000  # IMAGE_DLLCHARACTERISTICS_GUARD_CF
 CF_INSTRUMENTED, CF_TABLE = 0x100, 0x400  # IMAGE_GUARD_CF_INSTRUMENTED, IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT
 SLOT_BITS = 0x30000
 PAGE_READONLY = 0x02
+# PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_ON / _ALWAYS_OFF
+CFG_POLICY = {"on": 1 << 40, "off": 2 << 40}
+
+
+class StartupInfoEx(ctypes.Structure):
+    _fields_ = ([("cb", wintypes.DWORD), ("reserved", wintypes.LPWSTR), ("desktop", wintypes.LPWSTR),
+                 ("title", wintypes.LPWSTR)]
+                + [(field, wintypes.DWORD) for field in ("x", "y", "x_size", "y_size", "x_chars", "y_chars",
+                                                         "fill", "flags")]
+                + [("show", wintypes.WORD), ("reserved2_size", wintypes.WORD), ("reserved2", ctypes.c_void_p),
+                   ("stdin", wintypes.HANDLE), ("stdout", wintypes.HANDLE), ("stderr", wintypes.HANDLE),
+                   ("attributes", ctypes.c_void_p)])
+
+
+class ProcessInformation(ctypes.Structure):
+    _fields_ = [("process", wintypes.HANDLE), ("thread", wintypes.HANDLE), ("pid", wintypes.DWORD),
+                ("tid", wintypes.DWORD)]
+
+
+class SecurityAttributes(ctypes.Structure):
+    _fields_ = [("length", wintypes.DWORD), ("descriptor", ctypes.c_void_p), ("inherit", wintypes.BOOL)]
+
+
+def launch_cfg(image, policy, timeout=15):
+    """Start image under the Windows loader with an explicit per-process CFG policy ("on" or "off").
+
+    A /guard:cf image otherwise inherits the host's CFG setting, and with system CFG off the loader keeps the
+    image's own slots. The child's effective EnableControlFlowGuard bit is read from its handle after it ends.
+    stdin is NUL; stdout and stderr go to files beside the image. The child inherits only these three handles.
+    The four launches together stay well inside the test's CTest timeout; a launch that does not end records
+    the child's live threads before it is terminated.
+    """
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                   wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.InitializeProcThreadAttributeList.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                                         ctypes.POINTER(ctypes.c_size_t)]
+    kernel.UpdateProcThreadAttribute.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.c_size_t, ctypes.c_void_p,
+                                                 ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p]
+    kernel.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
+    kernel.CreateProcessW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p, ctypes.c_void_p,
+                                      wintypes.BOOL, wintypes.DWORD, ctypes.c_void_p, wintypes.LPCWSTR,
+                                      ctypes.c_void_p, ctypes.POINTER(ProcessInformation)]
+    kernel.GetProcessMitigationPolicy.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    image = Path(image)
+    paths = {stream: image.with_name(f"{image.stem}.{policy}.{stream}") for stream in ("stdout", "stderr")}
+    inherit = SecurityAttributes(ctypes.sizeof(SecurityAttributes), None, True)
+    opens = [("NUL", 0x80000000, 3, 3)] + [(str(paths[stream]), 0x40000000, 1, 2) for stream in ("stdout", "stderr")]
+    handles = []
+    for name, access, share, disposition in opens:  # GENERIC_READ OPEN_EXISTING, GENERIC_WRITE CREATE_ALWAYS
+        handle = kernel.CreateFileW(name, access, share, ctypes.byref(inherit), disposition, 0x80, None)
+        if handle in (None, wintypes.HANDLE(-1).value):
+            error = ctypes.WinError(ctypes.get_last_error())  # read before any other call can replace it
+            for opened in handles:
+                kernel.CloseHandle(opened)
+            raise OSError(f"opening {name} for the child: {error}")
+        handles.append(handle)
+    size = ctypes.c_size_t()
+    kernel.InitializeProcThreadAttributeList(None, 2, 0, ctypes.byref(size))
+    attributes = ctypes.create_string_buffer(size.value)
+    value = ctypes.c_uint64(CFG_POLICY[policy])
+    inherited = (wintypes.HANDLE * len(handles))(*handles)
+    info, process = StartupInfoEx(), ProcessInformation()
+    info.cb, info.flags = ctypes.sizeof(info), 0x100  # STARTF_USESTDHANDLES
+    info.stdin, info.stdout, info.stderr = handles
+    try:
+        if not kernel.InitializeProcThreadAttributeList(attributes, 2, 0, ctypes.byref(size)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if not kernel.UpdateProcThreadAttribute(attributes, 0, 0x20007, ctypes.byref(value), 8, None, None):
+                raise ctypes.WinError(ctypes.get_last_error())  # PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY
+            if not kernel.UpdateProcThreadAttribute(attributes, 0, 0x20002, inherited, ctypes.sizeof(inherited),
+                                                    None, None):
+                raise ctypes.WinError(ctypes.get_last_error())  # PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+            info.attributes = ctypes.addressof(attributes)
+            # EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW; the parent's error mode is inherited.
+            if not kernel.CreateProcessW(str(image), None, None, None, True, 0x00080000 | 0x08000000, None,
+                                         str(image.parent), ctypes.byref(info), ctypes.byref(process)):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            kernel.DeleteProcThreadAttributeList(attributes)
+    finally:
+        for handle in handles:
+            kernel.CloseHandle(handle)
+    live_threads = None
+    try:
+        signaled = kernel.WaitForSingleObject(process.process, timeout * 1000) == 0
+        if not signaled:
+            live_threads = thread_ids(process.pid)
+            kernel.TerminateProcess(process.process, 1)
+            kernel.WaitForSingleObject(process.process, 5000)
+        code, flags = wintypes.DWORD(), wintypes.DWORD()
+        kernel.GetExitCodeProcess(process.process, ctypes.byref(code))
+        if not kernel.GetProcessMitigationPolicy(process.process, 7, ctypes.byref(flags), 4):
+            raise ctypes.WinError(ctypes.get_last_error())  # ProcessControlFlowGuardPolicy
+    finally:
+        kernel.CloseHandle(process.thread)
+        kernel.CloseHandle(process.process)
+    return {"process_signaled": signaled, "code": code.value, "cfg": bool(flags.value & 1), "pid": process.pid,
+            "live_threads": live_threads, **{stream: {"bytes": path.read_bytes()} for stream, path in paths.items()}}
 
 
 def words(a, b, c, calls, d):
@@ -191,9 +302,19 @@ def main(mapper_path, io, *images):
                 "other": (0x99, words(0x22, 0x11, 0x33, 1, marker)),
                 "invalid": (0x77, words(0, 0, 0, 0, 0)),
             }
-            row = launch([staged], b"", timeout=30)
-            if not row["process_signaled"]:
-                raise AssertionError(f"{name}: Windows launch did not end: {row}")
+            if name.startswith("cfg_"):
+                row, control = launch_cfg(staged, "on"), launch_cfg(staged, "off")
+                for policy, launched in (("on", row), ("off", control)):
+                    if not launched["process_signaled"]:
+                        raise AssertionError(f"{name}: Windows launch with CFG {policy} did not end: {launched}")
+                    if launched["cfg"] != (policy == "on"):
+                        raise AssertionError(f"{name}: requested CFG {policy}, but the child reports "
+                                             f"EnableControlFlowGuard={int(launched['cfg'])}")
+                uncontrolled = (control["code"], trace(control["stderr"]["bytes"], control["stdout"]["bytes"]))
+            else:
+                row = launch([staged], b"", timeout=30)
+                if not row["process_signaled"]:
+                    raise AssertionError(f"{name}: Windows launch did not end: {row}")
             native = (row["code"], trace(row["stderr"]["bytes"], row["stdout"]["bytes"]))
             result, out, err = mapped(mapper_path, staged, staged_io, temp)
             started = result["status"] == STATUS["ok"] and result.get("started") == 1
@@ -207,7 +328,14 @@ def main(mapper_path, io, *images):
             observed[name] = native, mapped_row
 
             base = name.removeprefix("cfg_")
-            note = "mapped slots read-only and relocated"
+            note, control_note = "mapped slots read-only and relocated", ""
+            if name.startswith("cfg_"):
+                # Negative control: without CFG the loader keeps the image's own slots, so the /guard:cf
+                # image behaves like the same objects linked without /guard:cf.
+                if uncontrolled != expected[base]:
+                    raise AssertionError(f"{name}: Windows with CFG off {uncontrolled}, expected the {base} "
+                                         f"result {expected[base]}")
+                control_note = f"; Windows with CFG off {show(uncontrolled)} (same as {base})"
             if name in expected:
                 if native != expected[name] or mapped_row != expected[name]:
                     raise AssertionError(f"{name}: Windows {native}, pe_map {mapped_row}, expected {expected[name]}")
@@ -229,7 +357,7 @@ def main(mapper_path, io, *images):
                     raise AssertionError(f"{name}: pe_map {mapped_row}, status {result['status']}, "
                                          f"expected the current observation or an explicit CFG refusal: {result}")
             shown = show(mapped_row) if mapped_row is not None else "not started"
-            print(f"{name}: Windows {show(native)}; pe_map {shown}; {note}")
+            print(f"{name}: Windows {show(native)}; pe_map {shown}; {note}{control_note}")
 
         if observed["other"][0] == observed["record"][0]:
             raise AssertionError("the control binding was not distinguished")

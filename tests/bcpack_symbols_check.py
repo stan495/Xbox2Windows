@@ -87,6 +87,8 @@ class SymbolChecks(unittest.TestCase):
             self.assertEqual(result["syms"], vector["symbols"])
             self.assertEqual(result["consumed"], len(packet))
             self.assertTrue(all(lane["final"] in LEGAL for lane in result["lanes"]))
+            # The backend's callback-only order trace stays private.
+            self.assertEqual(set(result), {"syms", "consumed", "cycles", "lanes"})
             padded = decode(packet + bytes(17), BC1_WIDTHS, vector["blocks"])
             self.assertEqual(padded, result)
         self.assertTrue(any(len(lane["frags"]) > 1 for lane in result["lanes"]))
@@ -152,6 +154,13 @@ class SymbolChecks(unittest.TestCase):
                                     ([8], 1, bytes(MAX_INPUT + 1))):
             with self.subTest(widths=widths, count=count, length=len(data)), self.assertRaises(ValueError):
                 decode(data, widths, count)
+        # A well-formed stream must still arrive as bytes, not as a list or str.
+        values = [0, 1] * 7
+        packet = encode_fragment(1, 0, values)
+        self.assertEqual(decode(packet, [1], len(values))["syms"], [values])
+        for data in (list(packet), packet.decode("latin-1")):
+            with self.subTest(kind=type(data).__name__), self.assertRaisesRegex(ValueError, "bytes"):
+                decode(data, [1], len(values))
 
     def test_flushed_fragment_must_reach_home_state(self):
         # A real encoder can omit the last zero byte here. But dropping
@@ -204,12 +213,23 @@ class SymbolChecks(unittest.TestCase):
                        "--alphabet-bits", "1", "--symbols", str(len(values))]
             result = subprocess.run(command, capture_output=True, text=True, check=True)
             self.assertEqual(json.loads(result.stdout)["syms"], [values])
+
+            def assert_clean_failure(arguments, message):
+                failed = subprocess.run(arguments, capture_output=True, text=True)
+                self.assertEqual(failed.returncode, 1)
+                self.assertEqual(failed.stdout, "")
+                self.assertIn("BCPack symbols: " + message, failed.stderr)
+                self.assertNotIn("Traceback", failed.stderr)
+
             path.write_bytes(b"\xc0")
-            failed = subprocess.run(command, capture_output=True, text=True)
-            self.assertEqual(failed.returncode, 1)
-            self.assertEqual(failed.stdout, "")
-            self.assertIn("BCPack symbols:", failed.stderr)
-            self.assertNotIn("Traceback", failed.stderr)
+            assert_clean_failure(command, "")
+            # Zero padding is accepted, but the file read stops one byte past
+            # the 2 MiB bound: the same valid stream padded to MAX_INPUT + 1 fails.
+            path.write_bytes(encode_fragment(1, 0, values).ljust(MAX_INPUT + 1, b"\0"))
+            assert_clean_failure(command, "Expected 1..2097152 bytes")
+            # Argument errors and unreadable paths also exit 1 without a traceback.
+            assert_clean_failure(command[:5] + ["10"] + command[6:], "Expected integer symbol widths")
+            assert_clean_failure(command[:3] + [str(path) + ".missing"] + command[4:], "")
 
 
 if __name__ == "__main__":

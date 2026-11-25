@@ -139,19 +139,36 @@ def check_rejections(mapper, image, provider, symbol):
         address = imports.get_field_absolute_offset("VirtualAddress")
         length = imports.get_field_absolute_offset("Size")
         size = pe.OPTIONAL_HEADER.SizeOfImage
+        named_thunk = None
+        if isinstance(symbol, str):
+            pe.parse_data_directories(directories=[1])
+            desc, = pe.DIRECTORY_ENTRY_IMPORT
+            lookup = desc.struct.OriginalFirstThunk or desc.struct.FirstThunk
+            thunk_value = pe.get_qword_at_rva(lookup)
+            if len(desc.imports) != 1 or thunk_value >> 31:
+                raise AssertionError(f"{image.name}: unexpected named thunk {thunk_value:#x}")
+            named_thunk = (pe.get_offset_from_rva(lookup), thunk_value)
     bindings = {provider.name.casefold(): ctypes.CDLL(str(provider))}
-    for field, value, expected, message in (
-            (entry, size + 0x1000, "format", "entry point outside executable section"),
-            (address, size - 4, "format", "import directory outside image")):
+    cases = [
+        (entry, "<I", size + 0x1000, "format", "entry point outside executable section"),
+        (address, "<I", size - 4, "format", "import directory outside image"),
+    ]
+    if named_thunk is not None:
+        thunk_offset, thunk_value = named_thunk
+        for bit in (31, 32):
+            cases.append((thunk_offset, "<Q", thunk_value | (1 << bit), "format",
+                          f"import name for {provider.name} outside image"))
+    for field, fmt, value, expected, message in cases:
         data = bytearray(image.read_bytes())
-        struct.pack_into("<I", data, field, value)
+        struct.pack_into(fmt, data, field, value)
         with TemporaryDirectory() as temp:
             damaged = Path(temp) / image.name
             damaged.write_bytes(data)
             base, status, detail, requests = mapper(damaged, bindings)
         if base or status != STATUS[expected] or detail != message or requests:
             raise AssertionError(f"{message} control: {base=} {status=} {detail=} {requests=}")
-    print(f"{image.name}: rejected unbound {identity}, an entry point and an import directory outside the image")
+    print(f"{image.name}: rejected unbound {identity}, an entry point, an import directory outside the image"
+          + (", and reserved bits in a named import thunk" if named_thunk is not None else ""))
 
 
 LOAD_SEARCH = 0x00000100 | 0x00001000  # LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS

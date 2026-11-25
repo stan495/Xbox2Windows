@@ -143,7 +143,11 @@ def not_checked(reason):
         "calls": {},
         "declarations": [],
         "metadata_only": [],
+        "references": {},
+        "debug_only": [],
         "blocking": [],
+        "blocking_calls": [],
+        "blocking_references": [],
         "reported_names": [],
     }
 
@@ -171,7 +175,7 @@ def gate_submission(decision, module_text, submit):
     return decision
 
 
-def main() -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command")
     text = sub.add_parser("check-text", help="Gate a module given as disassembly text")
@@ -179,7 +183,7 @@ def main() -> int:
     shader = sub.add_parser("check", help="Gate a DXBC container through a validator probe")
     shader.add_argument("input", type=Path, help="DXBC container")
     shader.add_argument("--probe", type=Path, help="root_probe.exe path")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.command not in ("check-text", "check"):
         parser.print_help(sys.stderr)

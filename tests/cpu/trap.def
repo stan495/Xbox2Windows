@@ -2,3 +2,6 @@ EXPORTS
     trap_int3
     trap_ud2
     trap_branch
+    trap_ud1_reg
+    trap_ud1_mem
+    trap_ud1_disp

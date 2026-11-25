@@ -165,7 +165,7 @@ struct Fixture {
     {
         void* status = nullptr;
         void* queue = nullptr;
-        unsigned char description[0x20] = {};
+        unsigned char description[0x28] = {};
         *reinterpret_cast<std::uint16_t*>(description + 8) = 16;
         if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 4, "Status", nullptr, &status) != 0 ||
             reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, description, nullptr, &queue) != 0)
@@ -297,6 +297,9 @@ bool worker_cannot_start(Fixture& f)
 {
     Fixture::Queue q;
     if (!f.create(q, f.vtables)) return fail("cannot create the queue");
+    // A handle taken before the failure: it can only become signaled through the failure's SetEvent.
+    HANDLE early = queue_error_event(q.queue);
+    if (!early || WaitForSingleObject(early, 0) != WAIT_TIMEOUT) return fail("a new queue's error event was signaled");
     std::vector<unsigned char> destination(f.plain.size(), untouched);
     fail_thread_creation = true;
     thread_attempts = 0;
@@ -308,6 +311,25 @@ bool worker_cannot_start(Fixture& f)
     if (attempts < 2) return fail("the worker start did not try both stack sizes");
     if (!failed_at_submit(f, q)) return false;
     if (!untouched_bytes(destination)) return fail("the failed request changed its destination");
+    const DWORD signaled_early = WaitForSingleObject(early, 0);
+    // Acquire the event after the failure as well, to exercise its initial signal state without a worker.
+    HANDLE event = queue_error_event(q.queue);
+    if (!event) return fail("GetErrorEvent failed after Submit without a worker");
+    const DWORD notified = WaitForSingleObject(event, 0);
+    StorageErrorRecord record{};
+    queue_retrieve_error_record(q.queue, &record);
+    const DWORD reset = WaitForSingleObject(event, 0);
+    const DWORD reset_early = WaitForSingleObject(early, 0);
+    CloseHandle(event);
+    CloseHandle(early);
+    if (signaled_early != WAIT_OBJECT_0) return fail("the failure did not signal an event taken before it");
+    if (reset_early != WAIT_TIMEOUT) return fail("retrieve did not reset the event taken before the failure");
+    if (notified != WAIT_OBJECT_0 || reset != WAIT_TIMEOUT || record.failure_count != requests_per_run ||
+        record.first_failure.result != E_OUTOFMEMORY ||
+        record.first_failure.command_type != x2w_startup::command_type_request ||
+        record.first_failure.destination != destination.data() ||
+        record.first_failure.source != f.stream.data() || record.first_failure.source_size != f.stream.size())
+        return fail("failed request's record or event was wrong after Submit without a worker");
     return serves_next_request(f, q);
 }
 
@@ -356,6 +378,10 @@ bool one_allocation_fails(Fixture& f, int fail_enqueue, int fail_submit, int& th
         f.submit(q);
         disarm();
         trace("submit_done");
+    } catch (const std::exception& e) {
+        disarm();
+        std::fprintf(stderr, "exception left Submit: %s: %s\n", typeid(e).name(), e.what());
+        return fail("an exception left Submit");
     } catch (...) {
         disarm();
         return fail("an exception left Submit");
@@ -513,6 +539,10 @@ bool ordered_failure(Fixture& f, bool status_first, int requests, int fail_enque
         f.submit(q);
         disarm();
         trace("submit_done");
+    } catch (const std::exception& e) {
+        disarm();
+        std::fprintf(stderr, "exception left Submit: %s: %s\n", typeid(e).name(), e.what());
+        return fail("an exception left Submit");
     } catch (...) {
         disarm();
         return fail("an exception left Submit");

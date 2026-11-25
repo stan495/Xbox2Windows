@@ -16,11 +16,10 @@ def import_name(pe, ins, slots):
     if ins.op0_kind == K.NEAR_BRANCH64:
         target = ins.near_branch_target
         # A rel32 call or tail jump can target the linker-generated IAT thunk.
-        code = pe.get_data(target, 6)
+        code = image_bytes(pe, target, 6, executable=True)
         thunk = Decoder(64, code, ip=target).decode()
         if thunk.mnemonic != M.JMP or not thunk.is_ip_rel_memory_operand:
             return None
-        image_bytes(pe, target, thunk.len, executable=True)
         ins = thunk
     if ins.is_ip_rel_memory_operand:
         return slots.get(ins.ip_rel_memory_address)
@@ -88,8 +87,11 @@ def callback_setter(pe):
 
 def translate(pe, start, allocate, module, callback_slots):
     pe.parse_data_directories(directories=[1])
+    imports = getattr(pe, "DIRECTORY_ENTRY_IMPORT", None)
+    if not imports:
+        raise ValueError("image has no import directory")
     slots = {imp.address - pe.OPTIONAL_HEADER.ImageBase: imp.name
-             for desc in pe.DIRECTORY_ENTRY_IMPORT if desc.dll.lower() == module
+             for desc in imports if desc.dll.lower() == module
              for imp in desc.imports}
     if allocate:
         (bounds,) = function_ranges(pe, start)
@@ -206,14 +208,21 @@ extern "C" __declspec(dllexport) void heap_release(void* pointer) {
 """ + group
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--entries", nargs=2, type=lambda value: int(value, 0),
                         metavar=("ALLOC_RVA", "FREE_RVA"))
     parser.add_argument("--group-entry", help="Grouped allocation caller RVA or the fixture export heap_group")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.output.suffix.lower() != ".cpp" or args.output.resolve() == args.image.resolve():
         parser.error("choose a distinct .cpp output")
-    args.output.write_text(generate(args.image, args.entries, args.group_entry), encoding="ascii")
+    try:
+        args.output.write_text(generate(args.image, args.entries, args.group_entry), encoding="ascii")
+    except (ValueError, OSError, pefile.PEFormatError) as error:
+        parser.exit(1, f"{error}\n")
+
+
+if __name__ == "__main__":
+    main()

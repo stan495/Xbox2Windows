@@ -127,8 +127,7 @@ def check(mapper, probe, image, provider):
         copy, copied_provider = variants["DYNAMIC_BASE cleared"]
         free = child("windows", copy, copied_provider, mapper, probe, "no-reserve")
         if free["base"] != free["preferred"]:
-            raise AssertionError(f"unreserved DYNAMIC_BASE-cleared copy loaded at {free['base']:#x}, "
-                                 f"not its preferred base {free['preferred']:#x}")
+            raise AssertionError(f"DYNAMIC_BASE cleared / windows: unreserved control failed: {free}")
         print(f"DYNAMIC_BASE cleared / windows, nothing reserved: loaded at its preferred base {free['base']:#x}")
 
         for name, (copy, copied_provider) in variants.items():

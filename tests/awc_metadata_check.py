@@ -155,6 +155,8 @@ class MetadataChecks(unittest.TestCase):
             ("wrong tag owner", 20, "<I", 1 << 29 | 12),
             ("format truncated", 36, "<Q", 0x76 << 56 | 28 << 28 | 96),
             ("tag outside supplied span", 28, "<Q", 0x55 << 56 | 16 << 28 | 511),
+            ("empty stream table", 8, "<I", 0),
+            ("empty data tag", 28, "<Q", 0x55 << 56 | 0 << 28 | 208),
         ):
             with self.subTest(label=label):
                 awc = bytearray(fixture())
@@ -185,6 +187,36 @@ class MetadataChecks(unittest.TestCase):
             with self.subTest(label=label):
                 with self.assertRaisesRegex(ValueError, message):
                     read_formats(io.BytesIO(awc), 0, len(awc))
+
+    def test_sfx_accepts_limits(self) -> None:
+        from awc_metadata import read_bank
+
+        def formatted(streams, length=512) -> bytes:
+            # Every 0x76 tag records one sample at 48,000 Hz with codec 11.
+            awc = sfx_bank(streams, length)
+            for kind, _, offset in (tag for stream in streams for tag in stream):
+                if kind == 0x76:
+                    struct.pack_into("<IIH", awc, offset, 1, 0, 48000)
+                    awc[offset + 28] = 11
+            return bytes(awc)
+
+        # 4096 streams of two tags: header 16 + 4 * 4096 + 16 * 4096 = 81936, then 33 bytes per stream.
+        many = [[(0x55, 1, 81936 + 33 * i), (0x76, 32, 81937 + 33 * i)] for i in range(4096)]
+        high_id = bytearray(formatted([[(0x55, 16, 128), (0x76, 32, 160)]]))
+        struct.pack_into("<I", high_id, 16, 2 << 29 | 0x10000000)  # id bit 28 lies inside the 29-bit id field
+        one = [{"sample_rate_hz": 48000, "codec_id": 11, "streams": 1, "samples": 1}]
+        for label, awc, stream_count, formats in (
+            ("4096 streams", formatted(many, 81936 + 33 * 4096), 4096,
+             [{"sample_rate_hz": 48000, "codec_id": 11, "streams": 4096, "samples": 4096}]),
+            ("stream id 0x10000000", bytes(high_id), 1, one),
+            ("data touching the format tag", formatted([[(0x55, 16, 128), (0x76, 32, 144)]]), 1, one),
+            ("empty tag inside the format tag", formatted([[(0x55, 16, 128), (0x76, 32, 160), (0xBD, 0, 170)]]),
+             1, one),
+        ):
+            with self.subTest(label=label):
+                bank = read_bank(io.BytesIO(awc), 0, len(awc))
+                self.assertEqual((bank.layout, bank.stream_count, bank.music), ("sfx", stream_count, None))
+                self.assertEqual([asdict(g) for g in bank.formats], formats)
 
     def test_music_command(self) -> None:
         with TemporaryDirectory() as directory:
@@ -257,6 +289,11 @@ class MetadataChecks(unittest.TestCase):
              3, 4, MUSIC_FORMATS),
             ("repeated nonzero id", music_fixture(stream_words=(2 << 29 | 0, 0 << 29 | 0x102, 1 << 29 | 0x102)),
              3, 4, MUSIC_FORMATS),
+            ("stream id 0x10000000", music_fixture(stream_words=(2 << 29 | 0, 0 << 29 | 0x10000000, 1 << 29 | 0x102)),
+             3, 4, MUSIC_FORMATS),
+            ("empty tag inside the music header",
+             music_fixture(stream_words=(3 << 29 | 0, 0 << 29 | 0x101, 1 << 29 | 0x102),
+                           tags=(*DEFAULT_TAGS[:2], (0xBD, 0, 100), DEFAULT_TAGS[2])), 3, 4, MUSIC_FORMATS),
             ("unflagged v1", music_fixture(flags=0xff000001), 3, 4, MUSIC_FORMATS),
             ("codec 0 on every channel", music_fixture(records=tuple(r[:3] + (0,) for r in DEFAULT_RECORDS)),
              3, 4, [{"sample_rate_hz": 32000, "codec_id": 0, "streams": 1, "samples": 500},

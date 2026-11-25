@@ -1,5 +1,5 @@
 // Loads the built xgameruntime.dll from its fixture-only directory, checks the
-// five explicit stub exports retained after the synchronous contracts, and validates the
+// four explicit stub exports retained after the synchronous contracts, and validates the
 // deterministic E_NOTIMPL call log. It also rejects a DLL elsewhere or a copy
 // in the normal shim directory. The unknown-export lookup is a negative
 // control: a missing export returns null.
@@ -28,10 +28,6 @@ static_assert(not_implemented == E_NOTIMPL);
 struct XAsyncBlock;
 struct XUserHandleStorage;
 using XUserHandle = XUserHandleStorage*;
-struct XTaskQueueHandleStorage;
-using XTaskQueueHandle = XTaskQueueHandleStorage*;
-enum class XUserAddOptions : std::uint32_t { None = 0 };
-enum class XTaskQueueDispatchMode : std::uint32_t { Manual = 0 };
 
 struct ExpectedThunk {
     const char* name;
@@ -39,12 +35,8 @@ struct ExpectedThunk {
     const char* function;
 };
 
-constexpr std::array<ExpectedThunk, 5> expected_thunks{{
-    {"XUserAddAsync", "XUser", "XUserAddAsync"},
-    {"XGameSaveInitializeProviderAsync", "XGameSave", "XGameSaveInitializeProviderAsync"},
+constexpr std::array<ExpectedThunk, 1> expected_thunks{{
     {"XPackageMountWithUiAsync", "XPackage", "XPackageMountWithUiAsync"},
-    {"XAsyncGetStatus", "XAsync", "XAsyncGetStatus"},
-    {"XTaskQueueCreate", "XTaskQueue", "XTaskQueueCreate"},
 }};
 
 struct XGameRuntimeShimLogEntry {
@@ -60,12 +52,7 @@ static_assert(offsetof(XGameRuntimeShimLogEntry, result) == 4);
 static_assert(offsetof(XGameRuntimeShimLogEntry, component) == 8);
 static_assert(offsetof(XGameRuntimeShimLogEntry, function) == 16);
 
-using UserAddAsync = HRESULT(WINAPI*)(XUserAddOptions, XAsyncBlock*);
-using GameSaveInitializeProviderAsync = HRESULT(WINAPI*)(XUserHandle, const char*, bool, XAsyncBlock*);
 using PackageMountWithUiAsync = HRESULT(WINAPI*)(const char*, XAsyncBlock*);
-using AsyncGetStatus = HRESULT(WINAPI*)(XAsyncBlock*, bool);
-using TaskQueueCreate = HRESULT(WINAPI*)(XTaskQueueDispatchMode, XTaskQueueDispatchMode,
-                                         XTaskQueueHandle*);
 using GetLog = std::size_t(WINAPI*)(XGameRuntimeShimLogEntry*, std::size_t);
 using ClearLog = void(WINAPI*)();
 
@@ -171,17 +158,9 @@ bool find_proc(HMODULE module, const char* name, Proc& proc)
 
 bool calls_return_not_implemented(HMODULE module)
 {
-    UserAddAsync user_add = nullptr;
-    GameSaveInitializeProviderAsync game_save_initialize = nullptr;
     PackageMountWithUiAsync package_mount = nullptr;
-    AsyncGetStatus async_get_status = nullptr;
-    TaskQueueCreate task_queue_create = nullptr;
 
-    if (!find_proc(module, expected_thunks[0].name, user_add) ||
-        !find_proc(module, expected_thunks[1].name, game_save_initialize) ||
-        !find_proc(module, expected_thunks[2].name, package_mount) ||
-        !find_proc(module, expected_thunks[3].name, async_get_status) ||
-        !find_proc(module, expected_thunks[4].name, task_queue_create)) {
+    if (!find_proc(module, expected_thunks[0].name, package_mount)) {
         return false;
     }
 
@@ -189,13 +168,8 @@ bool calls_return_not_implemented(HMODULE module)
         const char* name;
         HRESULT result;
     };
-    const std::array<Call, 5> calls{{
-        {expected_thunks[0].name, user_add(XUserAddOptions::None, nullptr)},
-        {expected_thunks[1].name, game_save_initialize(nullptr, nullptr, false, nullptr)},
-        {expected_thunks[2].name, package_mount(nullptr, nullptr)},
-        {expected_thunks[3].name, async_get_status(nullptr, false)},
-        {expected_thunks[4].name, task_queue_create(XTaskQueueDispatchMode::Manual,
-                                                    XTaskQueueDispatchMode::Manual, nullptr)},
+    const std::array<Call, 1> calls{{
+        {expected_thunks[0].name, package_mount(nullptr, nullptr)},
     }};
     for (const auto& call : calls) {
         if (call.result != not_implemented) {

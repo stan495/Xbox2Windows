@@ -82,6 +82,41 @@ int main(int argc, char** argv)
     answered("d24s8 1x1 4 samples", texture(45, 1, 1, 4), {0x400000, 0x400000}, 0x20000);
     answered("d24s8 2560x1440 4 samples", texture(45, 2560, 1440, 4), {0x4C00000, 0x400000}, pad(0x4880000, 0x4650000));
     answered("r24g8_typeless 1024x1024", texture(44, 1024, 1024), {0x800000, 0x10000}, 0x500000);
+    // B8G8R8A8 at 4 bytes, and R16G16B16A16 at 8 where 32 bytes of samples tile as 64 x 32.
+    answered("bgra8 1920x1080 4 samples", texture(87, 1920, 1080, 4), {0x2000000, 0x400000}, pad(0x1FE0000, 0x1FB0000));
+    answered("rgba16f 1920x1080 4 samples", texture(10, 1920, 1080, 4), {0x4000000, 0x400000}, pad(0x3FC0000, 0x3F50000));
+    // The console 16-bit depth with stencil multisampled: 8 bytes of depth samples in 128 x 64
+    // tiles plus 4 bytes of stencil samples in 128 x 128 tiles; and the last of its three formats.
+    answered("d16s8 2560x1440 4 samples", texture(118, 2560, 1440, 4), {~0ull, 0}, pad(0x2BC0000, 0x2A30000));
+    answered("d16s8 format 120 2560x1440", texture(120, 2560, 1440), {~0ull, 0}, pad(0xB40000, 0xAA0000));
+    // A description that asks for 64 KiB alignment is in the rule.
+    D3D12_RESOURCE_DESC aligned = texture(19, 2048, 2048);
+    aligned.Alignment = 0x10000;
+    answered("d32s8 2048x2048 at 64 KiB alignment", aligned, {0x2000000, 0x10000}, 0x1400000);
+    // The same size as desktop with a smaller alignment is still answered.
+    answered("rgba8 1x1 4 samples, desktop size 64 KiB", texture(28, 1, 1, 4), {0x10000, 0x400000}, 0x10000);
+    // The first and last format of each multisampled colour family, 128 x 128 with four samples:
+    // 16, 8, 4, 2 and 1 bytes a texel give 1 MiB, 512, 256, 128 and 64 KiB.
+    const struct {
+        const char* name;
+        unsigned format;
+        unsigned long long expected;
+    } ends[] = {
+        {"r32g32b32a32_typeless 128x128 4 samples", 1, 0x100000},
+        {"r32g32b32a32_sint 128x128 4 samples", 4, 0x100000},
+        {"r16g16b16a16_typeless 128x128 4 samples", 9, 0x80000},
+        {"r16g16b16a16_sint 128x128 4 samples", 14, 0x80000},
+        {"r10g10b10a2_typeless 128x128 4 samples", 23, 0x40000},
+        {"r8g8b8a8_sint 128x128 4 samples", 32, 0x40000},
+        {"r16g16_sint 128x128 4 samples", 38, 0x40000},
+        {"r32_sint 128x128 4 samples", 43, 0x40000},
+        {"r16_typeless 128x128 4 samples", 53, 0x20000},
+        {"r16_sint 128x128 4 samples", 59, 0x20000},
+        {"r8_typeless 128x128 4 samples", 60, 0x10000},
+        {"a8_unorm 128x128 4 samples", 65, 0x10000},
+        {"b8g8r8x8_unorm_srgb 128x128 4 samples", 93, 0x40000},
+    };
+    for (const auto& end : ends) answered(end.name, texture(end.format, 128, 128, 4), {0x400000, 0x400000}, end.expected);
 
     // Left alone: formats with the same size on both sides, mip chains, other dimensions, sample
     // counts and formats outside the rule, and a console size that is not smaller.
@@ -109,6 +144,12 @@ int main(int argc, char** argv)
     left_alone("d16s8 wider than a 2D texture can be", shape, {~0ull, 0});
     shape = texture(118, 64, 0);
     left_alone("d16s8 zero height", shape, {~0ull, 0});
+    shape = texture(118, 0, 64);
+    left_alone("d16s8 zero width", shape, {~0ull, 0});
+    shape = texture(118, 64, 16385);
+    left_alone("d16s8 taller than a 2D texture can be", shape, {~0ull, 0});
+    shape = texture(118, 64, 64, 1, 2049);
+    left_alone("d16s8 more slices than a 2D array can have", shape, {~0ull, 0});
     shape = texture(118, 64, 64, 1, 1, 0);
     left_alone("d16s8 full mip chain (MipLevels 0)", shape, {~0ull, 0});
     left_alone("d32s8 full mip chain (MipLevels 0)", texture(19, 1024, 1024, 1, 1, 0), {0xA80000, 0x10000});
@@ -149,6 +190,6 @@ int main(int argc, char** argv)
         std::printf("startup_plane_size: %d FAILED\n", failures);
         return 1;
     }
-    std::printf("startup_plane_size: PASS (24 answered, 29 left alone)\n");
+    std::printf("startup_plane_size: PASS (43 answered, 32 left alone)\n");
     return 0;
 }

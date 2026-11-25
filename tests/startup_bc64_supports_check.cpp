@@ -16,12 +16,15 @@ struct Case {
     bool accepted;
 };
 
-constexpr auto chain_layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x109);
+constexpr UINT chain_layout = 0x109;
 
 D3D12_RESOURCE_DESC shape(UINT16 mips, UINT height, UINT16 slices, DXGI_FORMAT format)
 {
-    return {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1024, height, slices, mips, format, {1, 0}, chain_layout,
-            D3D12_RESOURCE_FLAG_NONE};
+    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1024, height, slices, mips, format, {1, 0},
+                            D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    static_assert(sizeof(desc.Layout) == sizeof(chain_layout));
+    std::memcpy(&desc.Layout, &chain_layout, sizeof(chain_layout));
+    return desc;
 }
 
 D3D12_RESOURCE_DESC nine() { return shape(9, 1024, 1, DXGI_FORMAT_BC7_UNORM); }
@@ -80,6 +83,76 @@ int main(int argc, char** argv)
         if (actual != c.accepted) {
             std::printf("FAIL %s: %s, expected %s\n", c.name, actual ? "accepted" : "rejected",
                         c.accepted ? "accepted" : "rejected");
+            ++failures;
+        }
+    }
+    if (failures) return 1;
+
+    // The chain arithmetic itself: the tail offsets and the in-tile bit interleave. The addrlib
+    // reference test covers these only when the addrlib source is configured, so a build without it
+    // had no check on `start()` or `address()` at all.
+    {
+        const x2w_startup::bc64::Chain chain(nine());
+        struct Offset {
+            const char* name;
+            UINT mip;
+            UINT expected;
+        };
+        const Offset offsets[] = {
+            {"nine mips, tail mip 3", 3, 0x8000},
+            {"nine mips, tail mip 4", 4, 0x4000},
+            {"nine mips, tail mip 5", 5, 0x2000},
+            {"nine mips, tail mip 6", 6, 0x1000},
+            {"nine mips, tail mip 7", 7, 0x800},
+            {"nine mips, tail mip 8", 8, 0x600},
+        };
+        for (const Offset& o : offsets) {
+            if (chain.start(o.mip) != o.expected) {
+                std::printf("FAIL %s: start(%u) = %#x, expected %#x\n", o.name, o.mip, chain.start(o.mip),
+                            o.expected);
+                ++failures;
+            }
+        }
+        // Each whole-tile mip starts one step after the next one, its own tiles plus that step.
+        for (UINT mip = 0; mip + 1 < x2w_startup::bc64::first_tail; ++mip) {
+            const UINT step = chain.tiles_wide(mip + 1) * chain.tiles_high(mip + 1) * x2w_startup::bc64::tile_bytes;
+            if (chain.start(mip) != chain.start(mip + 1) + step) {
+                std::printf("FAIL mip %u starts %#x, expected %#x + %#x\n", mip, chain.start(mip),
+                            chain.start(mip + 1), step);
+                ++failures;
+            }
+        }
+        // The interleave has to separate the axes: the same distance along x and along y lands in
+        // different bytes, and both are inside the tile.
+        const UINT at_origin = chain.address(0, 0, 0, 0), along_x = chain.address(0, 1, 0, 0),
+                   along_y = chain.address(0, 0, 1, 0);
+        if (at_origin != chain.start(0) || along_x == along_y) {
+            std::printf("FAIL address: origin %#x, x %#x, y %#x\n", at_origin, along_x, along_y);
+            ++failures;
+        }
+        if (along_x != at_origin + 64 || along_y != at_origin + 16) {
+            std::printf("FAIL address: one texel along x should be +64 and along y +16, got %#x and %#x\n",
+                        along_x - at_origin, along_y - at_origin);
+            ++failures;
+        }
+        // The high bits of both coordinates go through the same interleave, so a coordinate of 4
+        // (the first one that sets the bit-2 term) has to land 512 and 256 bytes out respectively.
+        const UINT far_x = chain.address(0, 4, 0, 0), far_y = chain.address(0, 0, 4, 0);
+        if (far_x - at_origin != 512 || far_y - at_origin != 256) {
+            std::printf("FAIL address: four texels along x should be +512 and along y +256, got %#x and %#x\n",
+                        far_x - at_origin, far_y - at_origin);
+            ++failures;
+        }
+        // One slice is the tile offsets plus mip 0's whole tiles, and a second slice starts after it.
+        if (chain.slice_bytes() != chain.start(0) + chain.tiles_wide(0) * chain.tiles_high(0) * x2w_startup::bc64::tile_bytes) {
+            std::printf("FAIL slice_bytes %#x is not start(0) plus mip 0's %u tiles\n", chain.slice_bytes(),
+                        chain.tiles_wide(0) * chain.tiles_high(0));
+            ++failures;
+        }
+        // A second slice of the nine-mip shape starts one slice further along.
+        if (chain.address(0, 0, 0, 1) != chain.slice_bytes() + at_origin) {
+            std::printf("FAIL address: slice 1 starts %#x, expected %#x\n", chain.address(0, 0, 0, 1),
+                        chain.slice_bytes() + at_origin);
             ++failures;
         }
     }

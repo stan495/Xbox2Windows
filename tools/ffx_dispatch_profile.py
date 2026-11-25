@@ -43,7 +43,10 @@ def inspect(pe):
     def resource_id(name, start, count):
         for i in range(count):
             row = start + i * 0x84
-            if pe.get_data(row + 4, 128).decode("utf-16le").split("\0", 1)[0] == name:
+            entry = pe.get_data(row + 4, 128)
+            if len(entry) < 128:
+                raise ValueError(f"Truncated resource descriptor at {row:#x}")
+            if entry.decode("utf-16le").split("\0", 1)[0] == name:
                 return pe.get_dword_at_rva(row)
         raise ValueError(f"Unknown binding {name}")
 
@@ -68,7 +71,10 @@ def inspect(pe):
                 writers.append((index, name, slot, record))
     if writers != [(26, "rw_mlsr_output_color", 2, 0xbd830)]:
         raise ValueError(f"Unexpected ID 16 writers {writers}")
-    if set(struct.unpack("<8I", pe.get_data(0x6fb20, 32))) != {0}:
+    selector = pe.get_data(0x6fb20, 32)
+    if len(selector) != 32:
+        raise ValueError("Truncated RCAS permutation selector")
+    if set(struct.unpack("<8I", selector)) != {0}:
         raise ValueError("Unexpected RCAS permutation selector")
     reader = 0xbc0d0
     if (bindings(reader, 0x40) != {"r_rcas_input": 18} or
@@ -78,17 +84,35 @@ def inspect(pe):
 
     for name, record, threads in [*predecessors, ("producer", writers[0][3], 256), ("rcas", reader, 64)]:
         blob = pointer(record + 8)
-        chunks = parts(pe.get_data(blob, pe.get_dword_at_rva(record)))
-        if struct.unpack_from("<3I", chunks[b"PSV0"], 40) != (threads, 1, 1):
+        container_size = pe.get_dword_at_rva(record)
+        container = pe.get_data(blob, container_size)
+        if len(container) != container_size:
+            raise ValueError(f"Truncated {name} shader container")
+        chunks = parts(container)
+        psv0 = chunks.get(b"PSV0")
+        if psv0 is None or len(psv0) < 52:
+            raise ValueError(f"Missing or truncated {name} PSV0 section")
+        if struct.unpack_from("<3I", psv0, 40) != (threads, 1, 1):
             raise ValueError(f"Unexpected {name} group size")
-        native = chunks[b"ACCC"]
-        if native[:4] != b"FSPX":
-            raise ValueError("Missing native compute shader")
+        native = chunks.get(b"ACCC")
+        if native is None or len(native) < 16 or native[:4] != b"FSPX":
+            raise ValueError(f"Missing or truncated {name} native compute shader")
         count, = struct.unpack_from("<I", native, 8)
-        sections = struct.iter_unpack("<4I", native[16:16+count*16])
-        (offset, size), = [(off, n) for tag, off, n, _ in sections if tag == 6]
-        code = native[offset+0x24:offset+size]
-        end, = [i+4 for i in range(0, len(code)-3, 4) if code[i:i+4] == b"\0\0\x81\xbf"]
+        table_end = 16 + count * 16
+        if table_end > len(native):
+            raise ValueError(f"Truncated {name} FSPX section table")
+        sections = struct.iter_unpack("<4I", native[16:table_end])
+        matches = [(off, n) for tag, off, n, _ in sections if tag == 6]
+        if len(matches) != 1:
+            raise ValueError(f"Expected single {name} FSPX code section, found {len(matches)}")
+        offset, size = matches[0]
+        if offset < table_end or size <= 0x24 or offset + size > len(native):
+            raise ValueError(f"Out-of-bounds {name} FSPX code section")
+        code = native[offset + 0x24:offset + size]
+        ends = [i + 4 for i in range(0, len(code) - 3, 4) if code[i:i + 4] == b"\0\0\x81\xbf"]
+        if len(ends) != 1:
+            raise ValueError(f"Expected single {name} s_endpgm terminator, found {len(ends)}")
+        end = ends[0]
         print(f"{name} container={blob:#x} threads={threads} code_bytes={end}")
         yield name, code[:end]
 
@@ -96,7 +120,10 @@ def inspect(pe):
     init_size, init_base = region(pe, 0x78e5, 0x78f1)
     if init_size.immediate(1) != 0x20000 or init_base.ip_rel_memory_address != 0x4eee0:
         raise ValueError("Unexpected i8 initializer")
-    yield "initializer", pe.get_data(init_base.ip_rel_memory_address, init_size.immediate(1))
+    init_data = pe.get_data(init_base.ip_rel_memory_address, init_size.immediate(1))
+    if len(init_data) != 0x20000:
+        raise ValueError("Truncated i8 initializer")
+    yield "initializer", init_data
 
 
 if __name__ == "__main__":

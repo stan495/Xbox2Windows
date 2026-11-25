@@ -95,10 +95,11 @@ def inspect(path):
         base = pe.OPTIONAL_HEADER.ImageBase
         memory, branches = instruction_refs(path, base)
         calls = {}
-        for desc in pe.DIRECTORY_ENTRY_IMPORT:
-            for imp in desc.imports:
-                name = imp.name.decode("ascii") if imp.name else ""
-                if (desc.dll.decode("ascii").lower(), name) not in EXPERIMENTS:
+        for desc in getattr(pe, "DIRECTORY_ENTRY_IMPORT", None) or ():
+            dll = desc.dll.decode("ascii", "replace").lower() if desc.dll else ""
+            for imp in getattr(desc, "imports", None) or ():
+                name = imp.name.decode("ascii", "replace") if imp.name else ""
+                if (dll, name) not in EXPERIMENTS:
                     continue
                 slot = imp.address - base
                 sites = []
@@ -111,18 +112,30 @@ def inspect(path):
                     containers=shader_containers(data, pe, memory))
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
-    args = parser.parse_args()
-    root = args.directory.resolve(strict=True)
+    args = parser.parse_args(argv)
+    try:
+        root = args.directory.resolve(strict=True)
+    except OSError as exc:
+        parser.error(str(exc))
+    if not root.is_dir():
+        parser.error(f"Input path is not a directory: {root}")
     output = Path(__file__).resolve().parents[1] / "out/calls/six-apis.json"
     if output.resolve().is_relative_to(root):
         parser.error("Choose a build directory separate from the report directory")
-    rows = {name: inspect(root / name) for name in NAMES}
+    missing = [name for name in NAMES if not (root / name).is_file()]
+    if missing:
+        parser.error(f"Missing expected image(s) in {root}: {', '.join(missing)}")
+    try:
+        rows = {name: inspect(root / name) for name in NAMES}
+    except (OSError, ValueError, pefile.PEFormatError, subprocess.SubprocessError) as exc:
+        parser.exit(1, f"call_evidence: {exc}\n")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
     print(output)
+    return 0
 
 
 if __name__ == "__main__":

@@ -87,6 +87,7 @@ WIDE_BINARY_HELPERS = {
         "vpsignb", "vpsignw", "vpsignd",
         "vpaddsb", "vpaddsw", "vpaddusb", "vpaddusw",
         "vpsubsb", "vpsubsw", "vpsubusb", "vpsubusw",
+        "vpmuldq", "vpmuludq", "vpmulhrsw", "vpsadbw",
     )
 }
 WIDE_BINARY_CODES = {
@@ -101,6 +102,7 @@ WIDE_BINARY_CODES = {
         "VPSIGNB", "VPSIGNW", "VPSIGND",
         "VPADDSB", "VPADDSW", "VPADDUSB", "VPADDUSW",
         "VPSUBSB", "VPSUBSW", "VPSUBUSB", "VPSUBUSW",
+        "VPMULDQ", "VPMULUDQ", "VPMULHRSW", "VPSADBW",
     )
 }
 # 256-bit one-source forms: the 128-bit helper runs on each half. vpshufhw/vpshuflw use the
@@ -373,6 +375,9 @@ ALLOWED_CODES |= WIDE_BINARY_CODES | WIDE_UNARY_CODES | WIDE_UNARY_IMM_CODES
 
 PRELUDE = """#include <cstdint>
 #include <cstring>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 using word = std::uint64_t;
 
@@ -1248,6 +1253,19 @@ static Vec256 op_vpinsrq(const Vec256& a, std::uint64_t val, std::uint8_t imm8) 
     out.q[imm8 & 1u] = val;
     return out;
 }
+#if defined(_MSC_VER)
+extern "C" __declspec(dllexport) std::uint32_t host_has_avx2() {
+    int info[4]{};
+    __cpuid(info, 1);
+    const int need = (1 << 27) | (1 << 28);
+    if ((info[2] & need) != need) return 0u;
+    if ((_xgetbv(0) & 6u) != 6u) return 0u;
+    __cpuid(info, 0);
+    if (info[0] < 7) return 0u;
+    __cpuidex(info, 7, 0);
+    return (info[1] & (1 << 5)) ? 1u : 0u;
+}
+#endif
 """
 
 

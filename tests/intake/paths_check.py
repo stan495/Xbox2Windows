@@ -176,6 +176,49 @@ def check_desktop_forwarders():
     finding, = report["findings"]
     assert finding["problem"] == "export_not_found" and finding["package_chain"] == gap["chain"]
     assert "bin/target.dll" in report["reachable"]
+    assert not finding["conditional"]
+    # The same broken known-DLL chain behind a delay import is a conditional finding.
+    row["kind"] = "delay"
+    finding, = trace(inventory, "entry.exe")["findings"]
+    assert finding["conditional"] and finding["reasons"] == ("delay",)
+
+
+def check_conditional_findings():
+    """Each unusable FFX route names its cause, and only a delay import's finding is conditional."""
+    loader = "amd_fidelityfx_loader_xbox.dll"
+    # Package paths keep their case on disk; the basename match ignores it.
+    upscaler = "pkg/AMD_FidelityFX_Upscaler_Xbox.dll"
+    framegen = "amd_fidelityfx_framegeneration_xbox.dll"
+    twins = [f"a/{framegen}", f"b/{framegen}"]
+    images = {loader: {"sha256": FFX_LOADER, "exports": []},
+              upscaler: {"sha256": "fixture", "exports": [{"name": "ffxQuery"}, {"name": "ffxDispatch"}]}}
+    images.update({n: {"sha256": "fixture", "exports": [{"name": s} for s in FFX_EXPORTS]} for n in twins})
+    imports = [dict(image=loader, kind=kind, dll=f"{kind}.dll", symbol="Value", bundle_exports_in=[],
+                    desktop_export="provider_not_found") for kind in ("normal", "delay")]
+    data = dict(images=images, imports=imports)
+
+    report = trace(data, loader)
+    findings = {f["dll"]: f for f in report["findings"]}
+    assert set(findings) == {"normal.dll", "delay.dll", "amd_fidelityfx_upscaler_xbox.dll", framegen}, findings
+    assert report["reachable"][upscaler]["reasons"] == ("ffx:0x10000",)
+    # The upscaler exports two of the five FFX entry points; the other three are listed in sorted order.
+    short = findings["amd_fidelityfx_upscaler_xbox.dll"]
+    assert short["problem"] == "conditional_exports_missing" and short["conditional"]
+    assert short["missing_exports"] == ["ffxConfigure", "ffxCreateContext", "ffxDestroyContext"]
+    assert short["candidates"] == [upscaler]
+    twin = findings[framegen]
+    assert twin["problem"] == "ambiguous_package_basename" and twin["conditional"]
+    assert twin["candidates"] == twins and twin["missing_exports"] == []
+    assert twin["reasons"] == ("ffx:0x20000|0x30000",)
+    assert findings["normal.dll"]["problem"] == findings["delay.dll"]["problem"] == "provider_not_found"
+    assert not findings["normal.dll"]["conditional"] and findings["delay.dll"]["conditional"]
+
+    for name in twins:
+        del images[name]
+    absent = {f["dll"]: f for f in trace(data, loader)["findings"]}[framegen]
+    assert absent["problem"] == "conditional_module_absent_from_package"
+    assert absent["candidates"] == [] and absent["missing_exports"] == []
+
 
 def main():
     loader = "amd_fidelityfx_loader_xbox.dll"
@@ -258,4 +301,5 @@ def check_pe32plus_import_reserved_bits():
 if __name__ == "__main__":
     check_desktop_forwarders()
     check_pe32plus_import_reserved_bits()
+    check_conditional_findings()
     main()

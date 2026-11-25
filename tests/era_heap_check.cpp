@@ -404,6 +404,48 @@ bool concurrency_checks()
     return ok.load();
 }
 
+// Every field of the ERA attribute layout (objectType:14, pageSize:2, allocatorId:8, alignment:5, memoryType:4,
+// reserved:31) at its widest value alone, all at once, and one word with a distinct value in each field. The
+// observed words leave the object type and the reserved bits at 0, so a narrowed mask or a shifted field boundary
+// would decode them unchanged. narrow_object_type expects a 13-bit object type and is the negative control.
+bool decode_field_checks(bool narrow_object_type)
+{
+    struct Case {
+        const char* name;
+        std::uint64_t word;
+        era_heap::Fields fields;
+    };
+    constexpr std::uint64_t mixed = 0x2a5cull | 2ull << 14 | 0xb7ull << 16 | 0x13ull << 24 | 9ull << 29 |
+                                    0x5a5a5a5ull << 33;
+    const Case cases[] = {
+        {"object type", 0x3fff, {0x3fff, 0, 0, 0, 0, 0}},
+        {"page size", 3ull << 14, {0, 3, 0, 0, 0, 0}},
+        {"allocator", 0xffull << 16, {0, 0, 0xff, 0, 0, 0}},
+        {"alignment", 0x1full << 24, {0, 0, 0, 0x1f, 0, 0}},
+        {"memory type", 0xfull << 29, {0, 0, 0, 0, 0xf, 0}},
+        {"reserved", 0x7fffffffull << 33, {0, 0, 0, 0, 0, 0x7fffffff}},
+        {"all ones", ~0ull, {0x3fff, 3, 0xff, 0x1f, 0xf, 0x7fffffff}},
+        {"mixed", mixed, {0x2a5c, 2, 0xb7, 0x13, 9, 0x5a5a5a5}},
+    };
+    bool ok = true;
+    for (const auto& c : cases) {
+        auto want = c.fields;
+        if (narrow_object_type) {
+            want.object_type &= 0x1fff;
+        }
+        const auto got = era_heap::decode(c.word);
+        if (got.object_type != want.object_type || got.page_size != want.page_size ||
+            got.allocator_id != want.allocator_id || got.alignment != want.alignment ||
+            got.memory_type != want.memory_type || got.reserved != want.reserved) {
+            std::printf("FAIL: decode %s: %x %u %x %u %u %llx\n", c.name, got.object_type, got.page_size,
+                        got.allocator_id, got.alignment, got.memory_type,
+                        static_cast<unsigned long long>(got.reserved));
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 int main(int argc, char** argv)
 {
     if (argc != 2) {
@@ -427,6 +469,10 @@ int main(int argc, char** argv)
         passed = graphics_type_checks();
     } else if (scenario == "concurrency"sv) {
         passed = concurrency_checks();
+    } else if (scenario == "decode_fields"sv) {
+        passed = decode_field_checks(false);
+    } else if (scenario == "decode_fields_control"sv) {
+        passed = decode_field_checks(true);
     } else {
         return 2;
     }

@@ -159,6 +159,74 @@ bool lifetime_check()
                 static_cast<unsigned long long>(era_physical::capacity_pages - 1));
     return true;
 }
+
+// Ownership as XMemMapPhysicalPages sees it (owns), from an empty registry to a full one and back.
+bool owns_check()
+{
+    using era_physical::Status;
+    using era_physical::capacity_pages;
+    using era_physical::owns;
+    const Module<Status> m{era_physical::allocate, era_physical::release, era_physical::granted_pages};
+    bool ok = true;
+    const auto expect = [&ok](bool condition, const char* what) {
+        if (!condition) std::printf("FAIL: owns: %s\n", what);
+        ok = ok && condition;
+    };
+
+    // Before the first grant the registry does not exist: nothing is owned and nothing releases.
+    const std::uint64_t first_page = 1, last_page = capacity_pages;
+    expect(!owns(0) && !owns(first_page) && !owns(last_page) && m.granted() == 0, "a page is owned before any grant");
+    expect(m.release(1, &first_page) == Status::invalid && m.granted() == 0, "a release before any grant was accepted");
+
+    // Two live grants: each of their pages is owned, other numbers are not.
+    Pages a, b;
+    if (!m.grant(4, a) || !m.grant(3, b)) {
+        expect(false, "setup: grants of 4 and 3 pages");
+        return false;
+    }
+    Pages live(a);
+    live.insert(live.end(), b.begin(), b.end());
+    std::sort(live.begin(), live.end());
+    expect(std::all_of(live.begin(), live.end(), owns), "a granted page is not owned");
+    std::uint64_t free_page = 1;
+    while (std::binary_search(live.begin(), live.end(), free_page)) ++free_page;
+    expect(!owns(free_page) && !owns(live.back() + 1), "a page that was never issued is owned");
+    expect(!owns(0) && !owns(capacity_pages + 1) && !owns(~std::uint64_t{0}) &&
+           !owns(std::uint64_t{1} << 32 | live.front()), "a number outside 1..capacity_pages is owned");
+
+    // A refused release changes no ownership; a whole release ends it for that grant only.
+    expect(m.release(2, b.data()) == Status::invalid && std::all_of(b.begin(), b.end(), owns),
+           "a refused release changed ownership");
+    expect(m.free(a) && std::none_of(a.begin(), a.end(), owns) && std::all_of(b.begin(), b.end(), owns),
+           "a release did not end ownership of exactly its grant");
+
+    // Granting every remaining page issues each number 1..capacity_pages exactly once, the last one
+    // included, and every one of them is owned.
+    Pages rest;
+    if (!m.grant(capacity_pages - b.size(), rest)) {
+        expect(false, "setup: grant of every remaining page");
+        return false;
+    }
+    Pages all(rest);
+    all.insert(all.end(), b.begin(), b.end());
+    std::sort(all.begin(), all.end());
+    bool every_number = all.size() == capacity_pages;
+    for (std::uint64_t i = 0; every_number && i < all.size(); ++i) every_number = all[i] == i + 1;
+    expect(every_number, "a full registry does not hold each page number once");
+    expect(owns(first_page) && owns(last_page), "last page: the first or last page number is not owned when granted");
+    expect(std::all_of(all.begin(), all.end(), owns), "a page of a full registry is not owned");
+    std::uint64_t one = 1, extra = 0;
+    expect(m.allocate(era_physical::mem_64k_pages, &one, &extra) == Status::exhausted && one == 0,
+           "a full registry granted another page");
+
+    // After every release nothing is owned.
+    expect(m.free(rest) && m.free(b) && m.granted() == 0, "cleanup: release every grant");
+    expect(!owns(first_page) && !owns(last_page) && std::none_of(all.begin(), all.end(), owns),
+           "a released page is still owned");
+    if (ok) std::printf("owns: 2 grants, %llu pages owned at full capacity\n",
+                        static_cast<unsigned long long>(all.size()));
+    return ok;
+}
 }
 
 int main(int argc, char** argv)
@@ -170,6 +238,8 @@ int main(int argc, char** argv)
         passed = controls_check();
     } else if (scenario == "lifetime"sv) {
         passed = lifetime_check();
+    } else if (scenario == "owns"sv) {
+        passed = owns_check();
     } else {
         return 2;
     }

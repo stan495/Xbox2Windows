@@ -37,6 +37,16 @@ CACHE_HINTS = {
     M.CLFLUSH: "_mm_clflush", M.CLFLUSHOPT: "_mm_clflushopt", M.CLWB: "_mm_clwb",
 }
 
+# The reserved/hint NOP encodings accepted by the integer lowering, by iced code. Every 0F 19 / 0F 1D /
+# 0F 1E / 0F 1F form in 16-, 32- and 64-bit operand size is listed: the size follows the ModRM form and all
+# of them are no-ops. A F3 prefix on 0F 1E decodes to the same code and is therefore accepted as well; only
+# reg=1/mod=11 in that encoding is RDSSP, which iced decodes as a different instruction.
+_RESERVED_NOP_CODES = frozenset(
+    getattr(C, "RESERVEDNOP_RM{0}_R{0}_{1}".format(size, opcode))
+    for size in (16, 32, 64)
+    for opcode in ("0F19", "0F1D", "0F1E", "0F1F")
+)
+
 INTEGER_HEADER = """#include <array>
 #include <cmath>
 #include <cstdint>
@@ -990,8 +1000,18 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
             # encodings stay refused.
             stmt = "__debugbreak();"
         elif i.code == C.UD2:
-            # UD2 (0F 0B) raises the host's STATUS_ILLEGAL_INSTRUCTION; UD0 and UD1 stay refused.
+            # UD2 (0F 0B) raises the host's STATUS_ILLEGAL_INSTRUCTION.
             stmt = "__ud2();"
+        elif i.code in (C.UD1_R16_RM16, C.UD1_R32_RM32, C.UD1_R64_RM64):
+            # UD1 (0F B9 /r) raises #UD as UD2 does (AMD64 APM Vol. 3 rev. 3.39, "UD0, UD1, UD2"). The lowering
+            # does not evaluate the ModRM operand; cpu_aot_trap measures that a memory form with an inaccessible
+            # address raises STATUS_ILLEGAL_INSTRUCTION natively too.
+            stmt = "__ud2();  // ud1"
+        elif op == M.UD0:
+            # The AMD64 APM encodes UD0 as 0F FF without a ModRM byte; iced's default decoding reads one, so the
+            # length, and every instruction after it, depends on the target vendor.
+            raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}; UD0's decoded length depends on "
+                             "the target vendor (0F FF without a ModRM byte on AMD)")
         elif op in (M.LDMXCSR, M.VLDMXCSR) and host_mxcsr is not None and i.op0_kind == K.MEMORY:
             # VLDMXCSR (VEX.128, vvvv 1111; iced decodes every other VEX form as invalid) behaves the same.
             # The opt-in host-MXCSR profile: the requested word is checked before it reaches the host register,
@@ -3066,7 +3086,15 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
             suffix, host = {1: ("8", "char"), 2: ("16", "short"), 4: ("", "long"), 8: ("64", "__int64")}[size]
             stmt = write_register(register, f"_InterlockedExchange{suffix}(reinterpret_cast<{host} volatile*>({address()}), "
                                             f"static_cast<{host}>({operand(n)}))")
-        elif op == M.NOP or (op == M.XCHG and i.op0_register == i.op1_register == R.AX):
+        elif op == M.NOP or i.code in _RESERVED_NOP_CODES or (op == M.XCHG and i.op0_register == i.op1_register == R.AX):
+            # The reserved/hint NOP space: 0F 19 /r, 0F 1D /r, 0F 1E /r and 0F 1F /r. The APM documents them as
+            # reserved hint NOPs that take a ModRM but access no memory, so lowering to ";" is exact: the operand
+            # is not evaluated, so no address is computed, nothing is loaded and nothing faults. Selection is by
+            # iced code rather than by mnemonic because iced also decodes 0F 0D (Group P, which aliases PREFETCH
+            # Exclusive), 0F 18 (PREFETCHT0-T2/PREFETCHNTA, with /6-/7 being PREFETCHIT1/0 under CPUID
+            # Fn8000_0021_EAX), 0F 1A, 0F 1B and 0F 1C as RESERVEDNOP; a mnemonic test would have lowered every
+            # one of those to a no-op. They stay refused here, as do CLDEMOTE (0F 1C /0), RDSSPD/RDSSPQ
+            # (F3 0F 1E /1), ENDBR64/ENDBR32 (F3 0F 1E FA/FB) and the MPX forms.
             stmt = ";"
         elif (op in (M.SETE, M.SETNE, M.SETA, M.SETAE, M.SETB, M.SETBE) or
               (x87_depth is None and op in (M.SETL, M.SETGE, M.SETLE, M.SETG, M.SETS, M.SETNS, M.SETO, M.SETNO))):

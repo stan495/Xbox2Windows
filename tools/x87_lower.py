@@ -26,8 +26,9 @@ The profile accepts:
   FNENI or FNDISI);
 - FFREEP ST(0) on a nonempty stack, which tags ST(0) empty and pops it as FSTP ST(0) does without storing it,
   and FFREE ST(i) of a register that is already empty (i at least the depth), which changes neither occupancy
-  nor TOP (FFREE of an occupied register, FFREEP with another register, FINCSTP and FDECSTP stay outside the
-  profile);
+  nor TOP, and FFREE ST(0) directly followed by FINCSTP on a nonempty stack, which pops ST(0) as FFREEP ST(0)
+  does when nothing branches to the FINCSTP (any other FFREE of an occupied register, FFREEP with another
+  register, FINCSTP on its own and FDECSTP stay outside the profile);
 A function starts with control word 0x027F, TOP 0, eight empty registers and a clear status word, and
 must return with the stack empty. The stack depth before every instruction is fixed at translation
 time, so each register maps to a C++ slot and no TOP is needed at run time. Translation rejects any x87
@@ -116,7 +117,7 @@ LEGACY_CONTROLS = {M.FNENI: "fneni", M.FNDISI: "fndisi", M.FNSETPM: "fnsetpm"}
 X87_OPS = frozenset({M.FLD, M.FST, M.FSTP, M.FXCH, M.FCHS, M.FABS, M.FSQRT, M.FRNDINT, M.FLD1, M.FLDZ, M.FLDPI, M.FLDL2T, M.FLDL2E,
                      M.FLDLG2, M.FLDLN2, M.FILD, M.FIST, M.FISTP, M.FISTTP, M.FXTRACT, M.FSCALE, *FCMOV, M.FCOMI,
                      M.FCOMIP, M.FUCOMI, M.FUCOMIP, M.FADD, M.FADDP, M.FSUB, M.FSUBP, M.FSUBR, M.FSUBRP, M.FMUL, M.FMULP,
-                     M.FDIV, M.FDIVP, M.FDIVR, M.FDIVRP, *IARITHMETIC, M.FNSTCW, M.WAIT, M.FLDCW, M.FCOM,
+                     M.FDIV, M.FDIVP, M.FDIVR, M.FDIVRP, *IARITHMETIC, M.FNSTCW, M.WAIT, M.FLDCW, M.FCOM, M.FINCSTP,
                      M.FCOMP, M.FCOMPP, M.FUCOM, M.FUCOMP, M.FUCOMPP, M.FNSTSW, M.FTST, M.FICOM, M.FICOMP,
                      M.FXAM, M.FNOP, M.FNCLEX, M.FPREM, M.FPREM1, M.FNINIT, M.FBLD, M.FBSTP, *LEGACY_CONTROLS, M.FFREEP, M.FFREE})
 # Comparisons into C0, C2 and C3 of the status word; FCOMPP and FUCOMPP pop twice, the other P forms once.
@@ -224,9 +225,24 @@ def is_x87(i):
     return i.mnemonic in X87_STATE_OPS
 
 
-def _effect(i, depth, checked=None):
-    """Stack depth after i, or a ValueError for an instruction or operand outside the profile."""
+def _discard_pairs(body):
+    """FFREE ST(0) followed directly by FINCSTP: ip of the FINCSTP -> ip of the FFREE. Together they tag ST(0)
+    empty and move TOP up by one, a pop without a store, so the stack stays contiguous."""
+    index = {i.ip: i for i in body}
+    return {i.next_ip: i.ip for i in body if i.mnemonic == M.FFREE and i.op0_register == R.ST0
+            and i.next_ip in index and index[i.next_ip].mnemonic == M.FINCSTP}
+
+
+def _effect(i, depth, checked=None, paired=False):
+    """Stack depth after i, or a ValueError for an instruction or operand outside the profile. paired is
+    whether i is a half of an FFREE ST(0), FINCSTP pair (_discard_pairs)."""
     op = i.mnemonic
+    if paired and op == M.FFREE:  # ST(0) is freed; the FINCSTP right after it pops
+        return depth
+    if paired and op == M.FINCSTP:  # TOP moves up past the freed ST(0), as FFREEP ST(0) does
+        if depth == 0:
+            raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
+        return depth - 1
     if i.code in ALIASES:
         raise ValueError(f"unsupported x87 encoding at {i.ip:#x}: {i}")
     if op in (M.FNSTCW, M.WAIT) or (op == M.FLDCW and checked is not None):  # no register stack access
@@ -377,13 +393,15 @@ def depths(body, exits, checked=None):
     """The x87 stack depth before each instruction of body, from an empty stack at body[0]. checked is the
     Checked entry's error channel, or None for the fixed control word."""
     index = {i.ip: i for i in body}
+    pairs = _discard_pairs(body)
     depth = {body[0].ip: 0}
     work = [body[0].ip]
     loads_cw = checked is not None and any(i.mnemonic in (M.FLDCW, M.FNINIT) for i in body)
     while work:
         i = index[work.pop()]
         before = depth[i.ip]
-        after = _effect(i, before, checked) if is_x87(i) else before
+        paired = i.ip in pairs or i.ip in pairs.values()
+        after = _effect(i, before, checked, paired) if is_x87(i) else before
         flow = i.flow_control
         if loads_cw and flow in (FlowControl.CALL, FlowControl.INDIRECT_CALL, FlowControl.INDIRECT_BRANCH):
             raise ValueError(f"x87 control word may be live at {i} at {i.ip:#x}")
@@ -399,6 +417,8 @@ def depths(body, exits, checked=None):
         if flow in (FlowControl.CONDITIONAL_BRANCH, FlowControl.UNCONDITIONAL_BRANCH):
             successors.append(i.near_branch_target)
         for target in successors:
+            if target in pairs and pairs[target] != i.ip:  # only the FFREE may reach the FINCSTP of a pair
+                raise ValueError(f"x87 branch into the FFREE ST(0), FINCSTP pair at {i.ip:#x} -> {target:#x}")
             if target in index:
                 if target not in depth:
                     depth[target] = after
@@ -649,7 +669,8 @@ def statement(i, depth, address, checked=None, parity=False, read="load", status
 
 def _statement(i, depth, address, checked, parity, status_word=False):
     op = i.mnemonic
-    _effect(i, depth, checked)
+    # depths() accepts FINCSTP, and FFREE of an occupied ST(0), only as an FFREE ST(0), FINCSTP pair.
+    _effect(i, depth, checked, op == M.FINCSTP or (op == M.FFREE and i.op0_register == R.ST0))
     top = depth - 1  # ST(k) is x87_slot[top - k]
     if op == M.FNSTCW:  # the fixed profile's control word is 0x027F
         word = "0x027f" if checked is None else "x87_cw"
@@ -669,8 +690,10 @@ def _statement(i, depth, address, checked, parity, status_word=False):
         return f";  // {LEGACY_CONTROLS[op]}"
     if op == M.FFREEP:  # the pop is the depth change; the freed slot is dead from here on
         return ";  // ffreep st(0)"
-    if op == M.FFREE:  # the register is already empty
+    if op == M.FFREE:  # the register is already empty, or ST(0) of a pair whose FINCSTP pops it
         return f";  // ffree st({i.op0_register - R.ST0})"
+    if op == M.FINCSTP:  # the pop is the depth change; the freed slot is dead from here on
+        return ";  // fincstp"
     if op == M.FTST:  # ST(0) compared with +0.0
         return f"{{ const int r = x87_compare(x87_slot[{top}], X87Value{{0, 0}}); {COMPARE_SW} }}  // ftst"
     if op in ICOMPARES:

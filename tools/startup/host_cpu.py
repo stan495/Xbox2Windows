@@ -9,10 +9,10 @@ illegal-instruction exception. Each site is rewritten once, in the running proce
   (flush_nop), and so does every later CLWB. A write-back hint has no effect a process can observe.
 - MONITORX (0F 01 FA) becomes a 3-byte NOP and MWAITX (0F 01 FB) becomes PAUSE; NOP. MWAITX may
   return at any time, so a caller already has to re-check its condition in a loop.
-- CLZERO (0F 01 FC) and the immediate SSE4a forms INSERTQ xmm, xmm, len, idx (F2 0F 78 /r ib ib)
-  and EXTRQ xmm, len, idx (66 0F 78 /0 ib ib) become a jump to a stub with the same effect. The
-  stubs keep every other register and the flags. Instructions the 5-byte jump overwrites are moved
-  behind the stub (plan_replacement).
+- CLZERO (0F 01 FC) and the SSE4a forms INSERTQ (F2 [REX] 0F 78 /r ib ib, F2 [REX] 0F 79 /r)
+  and EXTRQ (66 [REX] 0F 78 /0 ib ib, 66 [REX] 0F 79 /r) become a jump to a stub with the same
+  effect. The stubs keep every other register and the flags. Instructions the 5-byte jump
+  overwrites are moved behind the stub (plan_replacement).
 
 - MOVNTSS and MOVNTSD (F3/F2 [REX] 0F 2B /r) become MOVSS and MOVSD stores (opcode 11): the same
   bytes reach memory without the non-temporal hint.
@@ -23,10 +23,9 @@ illegal-instruction exception. Each site is rewritten once, in the running proce
   SHA256MSG2) are not rewritten: sha_apply performs one on register values the debugger reads from
   the stopped thread, at every hit. That is a debugger round trip per instruction.
 
-Limits: xmm0-7 only for the SSE4a forms (no REX prefix); the register forms of INSERTQ and EXTRQ
-(0F 79) are not handled; bits 127:64 of an SSE4a destination, undefined after the original
-instruction, keep their value. A thread that is inside the overwritten bytes of a jump site while
-another thread faults on it is not accounted for.
+Limits: bits 127:64 of an SSE4a destination, undefined after the original instruction, keep their
+value. A thread that is inside the overwritten bytes of a jump site while another thread faults on
+it is not accounted for.
 """
 import struct
 
@@ -137,32 +136,87 @@ def rdpid_stub(code):
     return at + 3, stub + b"\x5a\x59\x58"                                 # pop rdx; pop rcx; pop rax
 
 
-def sse4a_stub(code):
-    """Stub for the immediate INSERTQ or EXTRQ at the start of code (6 bytes), or None."""
-    if len(code) < 6 or code[1:3] != b"\x0f\x78" or code[0] not in (0xF2, 0x66) or code[3] < 0xC0:
+def _xmm_modrm(prefix, opcode, xmm, gpr=0, imm=()):
+    rex = 0x48 | (4 if xmm >= 8 else 0) | (1 if gpr >= 8 else 0)
+    return bytes([prefix, rex, *opcode, 0xC0 | (xmm & 7) << 3 | (gpr & 7), *imm])
+
+
+def _sse4a_decode(code):
+    """(length, insertq, reg_form, dest, src, width, offset) for SSE4a INSERTQ/EXTRQ, or None."""
+    if len(code) < 4 or code[0] not in (0xF2, 0x66):
         return None
-    width, offset = (code[4] & 63) or 64, code[5] & 63
+    rex = code[1] if 0x40 <= code[1] <= 0x4F else 0
+    at = 2 if rex else 1
+    if len(code) <= at + 2 or code[at] != 0x0F or code[at + 1] not in (0x78, 0x79):
+        return None
+    insertq = code[0] == 0xF2
+    reg_form = code[at + 1] == 0x79
+    length = at + (3 if reg_form else 5)
+    if len(code) < length:
+        return None
+    modrm = code[at + 2]
+    if modrm >> 6 != 3:
+        return None
+    reg, rm = (modrm >> 3) & 7, modrm & 7
+    if not insertq and not reg_form:
+        if reg:
+            return None
+        dest = src = rm | (8 if rex & 1 else 0)
+    else:
+        dest = reg | (8 if rex & 4 else 0)
+        src = rm | (8 if rex & 1 else 0)
+    if reg_form:
+        return length, insertq, True, dest, src, None, None
+    width, offset = (code[at + 3] & 63) or 64, code[at + 4] & 63
     if offset + width > 64:
         return None  # undefined result on the processor
-    mask = (1 << width) - 1
-    if code[0] == 0xF2:
-        dest, src = (code[3] >> 3) & 7, code[3] & 7
-        body = (bytes([0x66, 0x48, 0x0F, 0x7E, 0xC0 | src << 3]) +                       # movq rax, xmm_src
-                b"\x48\xb9" + struct.pack("<Q", mask) + b"\x48\x21\xc8" +                # and rax, mask
-                (bytes([0x48, 0xC1, 0xE0, offset]) if offset else b"") +                 # shl rax, offset
-                bytes([0x66, 0x48, 0x0F, 0x7E, 0xC0 | dest << 3 | 2]) +                  # movq rdx, xmm_dest
-                b"\x48\xb9" + struct.pack("<Q", ~(mask << offset) & (1 << 64) - 1) + b"\x48\x21\xca" +
-                b"\x48\x09\xc2")                                                         # or rdx, rax
-    else:
-        if (code[3] >> 3) & 7:
-            return None
-        dest = code[3] & 7
-        body = (bytes([0x66, 0x48, 0x0F, 0x7E, 0xC0 | dest << 3 | 2]) +                  # movq rdx, xmm_dest
-                (bytes([0x48, 0xC1, 0xEA, offset]) if offset else b"") +                 # shr rdx, offset
-                b"\x48\xb9" + struct.pack("<Q", mask) + b"\x48\x21\xca")                 # and rdx, mask
-    # pushfq; push rax; push rcx; push rdx ... pinsrq xmm_dest, rdx, 0; pop rdx; pop rcx; pop rax; popfq
-    return (b"\x9c\x50\x51\x52" + body + bytes([0x66, 0x48, 0x0F, 0x3A, 0x22, 0xC0 | dest << 3 | 2, 0x00]) +
-            b"\x5a\x59\x58\x9d")
+    return length, insertq, False, dest, src, width, offset
+
+
+def _sse4a_stub_with_length(code):
+    """(length, stub) for immediate or register INSERTQ/EXTRQ at the start of code, or None."""
+    decoded = _sse4a_decode(code)
+    if not decoded:
+        return None
+    length, insertq, reg_form, dest, src, width, offset = decoded
+    movq_src = _xmm_modrm(0x66, (0x0F, 0x7E), src, 0)                  # movq rax, xmm_src
+    movq_dest = _xmm_modrm(0x66, (0x0F, 0x7E), dest, 2)                # movq rdx, xmm_dest
+    pinsrq_dest = _xmm_modrm(0x66, (0x0F, 0x3A, 0x22), dest, 2, (0,))  # pinsrq xmm_dest, rdx, 0
+    if not reg_form:
+        mask = (1 << width) - 1
+        if insertq:
+            body = (movq_src +
+                    b"\x48\xb9" + struct.pack("<Q", mask) + b"\x48\x21\xc8" +
+                    (bytes([0x48, 0xC1, 0xE0, offset]) if offset else b"") +
+                    movq_dest +
+                    b"\x48\xb9" + struct.pack("<Q", ~(mask << offset) & (1 << 64) - 1) + b"\x48\x21\xca" +
+                    b"\x48\x09\xc2")
+        else:
+            body = (movq_dest +
+                    (bytes([0x48, 0xC1, 0xEA, offset]) if offset else b"") +
+                    b"\x48\xb9" + struct.pack("<Q", mask) + b"\x48\x21\xca")
+        return length, b"\x9c\x50\x51\x52" + body + pinsrq_dest + b"\x5a\x59\x58\x9d"
+    if insertq:
+        # pushfq; push rax; push rcx; push rdx; push rsi; push rdi
+        # pextrq rdi, xmm_src, 1; movq rax, xmm_src; movq rdx, xmm_dest
+        # mov ecx, edi; neg ecx; mov rsi, -1; shr rsi, cl; and rax, rsi
+        # mov rcx, rdi; shr rcx, 8; shl rax, cl; shl rsi, cl; not rsi; and rdx, rsi; or rdx, rax
+        body = (_xmm_modrm(0x66, (0x0F, 0x3A, 0x16), src, 7, (1,)) +
+                movq_src + movq_dest +
+                bytes.fromhex("89f9f7d948c7c6ffffffff48d3ee4821f04889f948c1e90848d3e048d3e648f7d64821f24809c2"))
+        return length, b"\x9c\x50\x51\x52\x56\x57" + body + pinsrq_dest + b"\x5f\x5e\x5a\x59\x58\x9d"
+    # EXTRQ xmm_dest, xmm_src: ctrl in xmm_src[63:0], value in xmm_dest[63:0].
+    # movq rax, xmm_src; movq rdx, xmm_dest; mov rcx, rax; shr rcx, 8; shr rdx, cl
+    # mov ecx, eax; neg ecx; mov rax, -1; shr rax, cl; and rdx, rax
+    body = (movq_src + movq_dest +
+            bytes.fromhex("4889c148c1e90848d3ea89c1f7d948c7c0ffffffff48d3e84821c2"))
+    return length, b"\x9c\x50\x51\x52" + body + pinsrq_dest + b"\x5a\x59\x58\x9d"
+
+
+def sse4a_stub(code):
+    """Stub for immediate or register INSERTQ/EXTRQ at the start of code, or None."""
+    result = _sse4a_stub_with_length(code)
+    return result[1] if result else None
 
 
 def stub_for(code):
@@ -172,8 +226,7 @@ def stub_for(code):
     rdpid = rdpid_stub(code)
     if rdpid:
         return rdpid
-    stub = sse4a_stub(code)
-    return (6, stub) if stub else None
+    return _sse4a_stub_with_length(code)
 
 
 def plan_replacement(code, site, length, stub, stub_address):

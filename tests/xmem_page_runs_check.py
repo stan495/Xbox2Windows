@@ -278,6 +278,46 @@ def reader_while_toggling(shim, base, seconds, announce=None):
     return toggles, seen[0]
 
 
+def window_events(name):
+    """The two events of the test build's X2W_XMEM_TEST_HOLD_WINDOW=<name> hook: the unmap sets
+    <name>.unmapped, then waits for <name>.release."""
+    kernel = C.WinDLL("kernel32", use_last_error=True)
+    create = bind(kernel, "CreateEventW", [C.c_void_p, C.c_int, C.c_int, C.c_wchar_p], C.c_void_p)
+    wait = bind(kernel, "WaitForSingleObject", [C.c_void_p, C.c_ulong], C.c_ulong)
+    signal = bind(kernel, "SetEvent", [C.c_void_p], C.c_int)
+    unmapped, release = create(None, 1, 0, name + ".unmapped"), create(None, 1, 0, name + ".release")
+    assert unmapped and release, C.get_last_error()
+    return unmapped, release, wait, signal
+
+
+def reader_in_window(shim, base, name, announce):
+    """The reader waits, without the GIL, until the unmap holds the neighbouring run apart, then
+    reads a page of it: the read always falls into the window where the view is gone. Returns
+    False when the unmap never reached the window within ten seconds."""
+    unmapped, release, wait, signal = window_events(name)
+    tokens = shim.pages(64)
+    assert shim.contiguous(base, 64, tokens) == base
+    mark(base, 64, 0x44440000)
+    reached = [False]
+
+    def read_once():
+        if wait(unmapped, 10000) != 0:
+            return
+        reached[0] = True
+        print("child: reader reads the unmapped page", flush=True)
+        word(base + 20 * PAGE).value
+        signal(release)
+
+    print(announce, flush=True)
+    reader = threading.Thread(target=read_once)
+    reader.start()
+    one_address, one_page = (shim.pointer * 1)(base + 21 * PAGE), (shim.number * 1)(tokens[21])
+    while reader.is_alive():
+        assert shim.scatter(one_address, 1, None), C.get_last_error()
+        assert shim.scatter(one_address, 1, one_page), C.get_last_error()
+    return reached[0]
+
+
 def handled_exception():
     """An access violation that has nothing to do with the shim, raised and handled the usual way."""
     try:
@@ -408,8 +448,17 @@ def child(path, mode):
     shim = Shim(path)
     base = shim.whole + PAGE
     if mode == "reader-without-retry":
-        # The parent set X2W_XMEM_NO_FAULT_RETRY=1: the reader's first fault ends the process.
+        # The parent set X2W_XMEM_NO_FAULT_RETRY=1 and X2W_XMEM_TEST_HOLD_WINDOW: the unmap waits in
+        # the window until the reader has read, and the reader's fault ends the process.
+        if not reader_in_window(shim, base, os.environ["X2W_XMEM_TEST_HOLD_WINDOW"], "child: reader starts"):
+            print("child: the unmap never held the window for the reader (hook missing or timed out)", flush=True)
+            return 3
+        print("child: reader survived", flush=True)
+    elif mode == "hold-ignored":
+        # The deployed shim has no hold: the same variables change nothing and the unmap never waits.
+        unmapped, release, wait, signal = window_events(os.environ["X2W_XMEM_TEST_HOLD_WINDOW"])
         reader_while_toggling(shim, base, 3.0, announce="child: reader starts")
+        assert wait(unmapped, 0) != 0, "the deployed shim held an unmap in the window"
         print("child: reader survived", flush=True)
     elif mode == "read-forgotten":
         # A page inside the range of the last break that the shim has forgotten: the handler must
@@ -431,6 +480,7 @@ def run_child(path, mode, environment=()):
 def expect_access_violation(path, mode, marker, environment=()):
     result = run_child(path, mode, environment)
     code = result.returncode & 0xFFFFFFFF
+    assert "never held the window" not in result.stdout, f"{mode}: the hold hook did not run: {result.stdout!r}"
     assert marker in result.stdout, f"{mode}: the child stopped before its step: {result.stdout!r} {result.stderr[-400:]!r}"
     for finished in ("survived", "returned", "delivered"):
         assert finished not in result.stdout, f"{mode}: no fault: {result.stdout!r}"
@@ -470,12 +520,14 @@ def main(path, controls, total=6000):
         test_shim.close()
     # Controls that must end in an access violation, each in a child process, on the test build:
     # shared views without the handler, and a read of a page the shim has forgotten.
-    expect_access_violation(controls, "reader-without-retry", "child: reader starts", {"X2W_XMEM_NO_FAULT_RETRY": "1"})
+    hold = {"X2W_XMEM_NO_FAULT_RETRY": "1", "X2W_XMEM_TEST_HOLD_WINDOW": f"x2w-xmem-hold-{os.getpid()}"}
+    expect_access_violation(controls, "reader-without-retry", "child: reader reads the unmapped page", hold)
     expect_access_violation(controls, "read-forgotten", "child: reading a forgotten page")
-    # The deployed shim ignores X2W_XMEM_NO_FAULT_RETRY: the same reader survives there.
-    result = run_child(path, "reader-without-retry", {"X2W_XMEM_NO_FAULT_RETRY": "1"})
+    # The deployed shim ignores X2W_XMEM_NO_FAULT_RETRY and the hold: the reader survives there and
+    # no unmap waits in the window.
+    result = run_child(path, "hold-ignored", hold)
     assert result.returncode == 0 and "child: reader survived" in result.stdout, (
-        f"the deployed shim honoured X2W_XMEM_NO_FAULT_RETRY: {result.returncode & 0xFFFFFFFF:#x} {result.stdout!r}")
+        f"the deployed shim honoured a test switch: {result.returncode & 0xFFFFFFFF:#x} {result.stdout!r} {result.stderr[-400:]!r}")
     # Lifetime of the handler, on the deployed shim, each in a process of its own.
     default = {k: v for k, v in os.environ.items() if k != "X2W_XMEM_SHARED_VIEWS"}
     result = subprocess.run([sys.executable, "-B", __file__, "--child", "default-unload", str(path)], capture_output=True,

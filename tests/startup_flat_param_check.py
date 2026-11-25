@@ -16,6 +16,9 @@ Before #1259 the flat copy was a float4 written from the float export. FXC folds
 and flushed the three denormal patterns to 0. The draw keeps that form as a negative control, and the same
 form with the words computed at run time as a second control: that one is exact, so the loss is the
 constant fold, not the flat interface.
+
+The controls also replace the first read with each parameter selector in both encodings (#1890): p0 must
+give the same pixel stage, and p10, p20 and an invalid selector must be refused, not read as p0.
 """
 import re
 import struct
@@ -71,6 +74,22 @@ s_endpgm
 """
 LINEAR_PS_WORDS = bytes.fromhex('0203fcbe' '000008c8' '010009c8' '0f1800f802020202' '000081bf')
 
+# The parameter selector of the first read, in both encodings (#1890). Only p0 is the flat copy; p10 (P1 - P0)
+# and p20 (P2 - P0) need per-vertex attribute values, which the FXC path does not have, so they are refused.
+# Each line replaces the first read of PS_WORDS; the decoded text must be the source line (LLVM's spelling).
+SELECTOR_SOURCE = """\
+v_interp_mov_f32_e32 v0, p10, attr0.x
+v_interp_mov_f32_e32 v0, p20, attr0.x
+v_interp_mov_f32_e32 v0, p0, attr0.x
+v_interp_mov_f32_e64 v0, p10, attr0.x
+v_interp_mov_f32_e64 v0, p20, attr0.x
+v_interp_mov_f32_e64 v0, p0, attr0.x
+"""
+SELECTOR_WORDS = tuple(bytes.fromhex(w) for w in (
+    '000002c8', '010002c8', '020002c8', '000002d600000000', '000002d600020000', '000002d600040000'))
+# VINTRP vsrc 3: llvm-objdump prints invalid_param_3 and llvm-mc accepts no such selector.
+INVALID_SELECTOR_WORD = bytes.fromhex('030002c8')
+
 WORDS = (0x00000001, 0x00000002, 0x7fc00001, 0x80000001)
 EXPECTED = ','.join('%08x' % w for w in WORDS)
 FLUSHED = '00000000,00000000,7fc00001,00000000'
@@ -118,6 +137,8 @@ def controls():
     assert 'U(i.fparam' not in ps, ps
     print('flat: VS o.fparam0 = uint4(v6, v7, v8, v9); PS v0..v3 = i.fparam0.xyzw, no float conversion')
 
+    check_selectors(ps)
+
     # An attribute read only interpolated gets no flat copy in either stage.
     pipe = translate(LINEAR_PS_WORDS)
     vs, ps = pipe.hlsl_vs(), pipe.hlsl_ps()
@@ -130,6 +151,38 @@ def controls():
     assert 'o.fparam0 = o.param0;' in old_vs and 'U(i.fparam0.w)' in old_ps
     assert run_time(old_vs).count('+ ((vid >> 31) << 23)') == 4
     print('controls: float4 flat copy (before #1259) and its run-time form')
+
+
+def with_first_read(word):
+    """PS_WORDS with its first read (v_interp_mov_f32 v0, p0, attr0.x) replaced by `word`."""
+    assert PS_WORDS[4:8] == SELECTOR_WORDS[2]
+    return PS_WORDS[:4] + word + PS_WORDS[8:]
+
+
+def check_selectors(ps):
+    """p0 is lowered in both encodings; p10, p20 and an invalid selector are refused, never read as p0 (#1890)."""
+    for line, word in zip(SELECTOR_SOURCE.splitlines(), SELECTOR_WORDS):
+        (_, size, name, asm), = G.decode(word)
+        assert (size, asm) == (len(word), line), (word.hex(), size, asm)
+        selector = line.split(', ')[1]
+        try:
+            translated = translate(with_first_read(word)).hlsl_ps()
+        except G.Unsupported as error:
+            assert selector != 'p0', (line, error)
+            assert 'parameter selector %s' % selector in str(error), (line, error)
+            print('refused: %s (%s)' % (line, error))
+            continue
+        assert selector == 'p0', 'translated %s as %s' % (line, re.findall(r'v0 = i\.[^;]*;', translated))
+        assert translated == ps, translated
+        print('lowered: %s -> v0 = i.fparam0.x;' % line)
+    (_, _, name, asm), = G.decode(INVALID_SELECTOR_WORD)
+    assert name.endswith('_unsupported'), asm
+    try:
+        translate(with_first_read(INVALID_SELECTOR_WORD))
+    except G.Unsupported as error:
+        print('refused: VINTRP selector 3 (%s)' % error)
+    else:
+        raise AssertionError('VINTRP selector 3 was translated')
 
 
 def assemble(llvm_mc, source):
@@ -149,6 +202,10 @@ def check_binary(llvm_mc):
         built = assemble(llvm_mc, source)
         if built != words:
             raise AssertionError('%s fixture: assembled %s, recorded %s' % (name, built.hex(), words.hex()))
+    for line, words in zip(SELECTOR_SOURCE.splitlines(), SELECTOR_WORDS):
+        built = assemble(llvm_mc, line + '\n')
+        if built != words:
+            raise AssertionError('selector fixture %s: assembled %s, recorded %s' % (line, built.hex(), words.hex()))
     print('fixture words match llvm-mc')
 
 

@@ -52,10 +52,19 @@ def check_decoding():
     amd = scan.decode(AMD_WORD)
     check(amd == {"object_type": 0, "page_size": 1, "allocator_id": 0, "alignment": 8, "memory_type": 5,
                   "reserved": 0}, "AMD word fields")
+    # Bits 0-32 all set plus reserved bit 33: every field at its widest value, so each mask is checked
+    # at full width (neither word above sets an object type bit).
+    widest = scan.decode(0x3FFFFFFFF)
+    check(widest == {"object_type": 0x3FFF, "page_size": 3, "allocator_id": 0xFF, "alignment": 0x1F,
+                     "memory_type": 0xF, "reserved": 1}, f"widest word fields {widest}")
     cases = {
         BINK_WORD: HEAP32,
         0: HEAP16,
+        # 1 << 12 is exactly one 4 KiB page: era_heap pages an alignment only above the page size.
+        12 << 24: "heap: aligned allocation, 4096-byte alignment",
         13 << 24: "heap: page-backed, 8192-byte alignment",
+        # Memory type 6 is the last graphics type; 4 KiB pages and 16-byte alignment fit in 64 KiB.
+        6 << 29: GRAPHICS,
         AMD_WORD: GRAPHICS,
         (1 << 29) | (2 << 14): "null: graphics page size or alignment above the allocation granularity",
         (1 << 29) | (17 << 24): "null: graphics page size or alignment above the allocation granularity",
@@ -67,7 +76,7 @@ def check_decoding():
     }
     for word, expected in cases.items():
         check(scan.desktop(word) == expected, f"desktop({word:#x}) = {scan.desktop(word)!r}")
-    print(f"decoding: {len(cases) + 2} cases passed")
+    print(f"decoding: {len(cases) + 3} cases passed")
 
 
 def sites_by_export(report, path):

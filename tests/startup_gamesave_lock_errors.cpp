@@ -1,7 +1,8 @@
 // Experimental (docs/startup-runtime.md): which failed Win32 lock requests mean "held elsewhere, try
-// again later" (busy) and which are real errors, and how the save lock waits and reports a failure.
-// The mapping is plain integer logic, so it runs on every platform with the codes a Windows node
-// reports; the wait and error cases use real lock files in a temporary folder. Synthetic data only.
+// again later" (busy) and which are real errors, how the save lock waits and reports a failure, and
+// that a reused, released or destroyed lock object frees its lock. The mapping is plain integer
+// logic, so it runs on every platform with the codes a Windows node reports; the other cases use real
+// lock files in a temporary folder. Synthetic data only.
 #include <startup_stubs/file_lock.h>
 
 #include <chrono>
@@ -125,6 +126,47 @@ void check_error_reporting(const std::filesystem::path& dir, const std::filesyst
     expect(probe.acquire(lock_file, false, std::chrono::milliseconds(0)) == LockResult::locked, "a shared lock joins a shared lock");
     expect(probe.last_error() == 0, "a lock after an error leaves no error");
 }
+
+// The store keeps one FileLock per operation and relies on its destructor; a lock object can also be
+// reused. Each case is checked from a second object, which can only take the lock once the first
+// one's handle is closed: an acquire must drop what the object held before, the destructor must drop
+// the lock, and a second release must not touch a handle the object no longer owns.
+void check_release_paths(const std::filesystem::path& dir)
+{
+    using namespace x2w_save;
+    const std::filesystem::path first = dir / "reuse_a.lock", second = dir / "reuse_b.lock";
+    const auto at_once = std::chrono::milliseconds(0);
+
+    FileLock reused;
+    expect(reused.acquire(first, true, at_once) == LockResult::locked, "reuse: the object takes a free lock");
+    expect(reused.acquire(first, true, at_once) == LockResult::locked,
+           "re-acquire: taking the same lock again on the same object succeeds (its earlier hold is dropped first)");
+    expect(reused.acquire(second, true, at_once) == LockResult::locked, "reuse: the object moves to a second lock");
+    FileLock other;
+    expect(other.acquire(first, true, at_once) == LockResult::locked,
+           "re-acquire: moving to another file frees the lock the object held before");
+    expect(other.acquire(second, true, at_once) == LockResult::timeout, "reuse: the second lock is still held by the object");
+    reused.release();
+    other.release();
+
+    {
+        FileLock scoped;
+        expect(scoped.acquire(first, true, at_once) == LockResult::locked, "scope: the object takes a free lock");
+    }
+    expect(other.acquire(first, true, at_once) == LockResult::locked, "destructor: a destroyed object frees its lock");
+    other.release();
+
+    // The released object's old handle value is free for the system to hand out again, often to the
+    // very next open; a stale copy of it must not be closed on the second release.
+    FileLock once;
+    expect(once.acquire(first, true, at_once) == LockResult::locked, "double release: the object takes a free lock");
+    once.release();
+    FileLock holder;
+    expect(holder.acquire(first, true, at_once) == LockResult::locked, "double release: a second object takes the freed lock");
+    once.release();
+    expect(other.acquire(first, true, at_once) == LockResult::timeout,
+           "double release: releasing an object twice leaves the lock another object now holds");
+}
 }  // namespace
 
 int main()
@@ -147,6 +189,7 @@ int main()
     try {
         check_long_wait(dir / "wait.lock");
         check_error_reporting(dir, dir / "err.lock");
+        check_release_paths(dir);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: exception %s\n", e.what());
         ++failures;

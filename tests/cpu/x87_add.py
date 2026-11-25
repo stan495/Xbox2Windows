@@ -370,6 +370,19 @@ class Runner:
         self.seeded = self.harness.x87_seeded
         self.seeded.argtypes, self.seeded.restype = [ctypes.c_void_p] * 4, ctypes.c_uint64
         self.lib = ctypes.CDLL(str(Path(path).resolve()))
+        self.path = Path(path).resolve()
+
+    def export(self, name):
+        """The fixture export `name`, or a message that names the stale DLL."""
+        try:
+            return getattr(self.lib, name)
+        except AttributeError:
+            # A partial build leaves the variants at their previous revision, so the newest
+            # export can be missing from one of them. Say which file and what to rebuild.
+            raise AssertionError(
+                f"{self.path.name} has no export {name!r}: this fixture DLL predates the export. "
+                f"Rebuild the target that produces {self.path.name} before running this check."
+            ) from None
 
     def _buffers(self, data):
         guard = b"\xa5" * GUARD
@@ -384,7 +397,7 @@ class Runner:
 
     def __call__(self, name, data):
         guard, source, target = self._buffers(data)
-        function = ctypes.cast(getattr(self.lib, name), ctypes.c_void_p).value
+        function = ctypes.cast(self.export(name), ctypes.c_void_p).value
         state = self.call(function, ctypes.addressof(source) + GUARD, ctypes.addressof(target) + GUARD)
         return self._output(name, data, guard, source, target), state
 

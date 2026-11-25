@@ -384,7 +384,7 @@ def check_negative_controls():
         raise AssertionError(f"expected unconditional volatile read for CMOV memory source:\n{emitted}")
 
     # 2. Rejection of unhandled / malformed operations
-    # UD0 should be rejected cleanly with ValueError (UD2 is lowered since #1021, UD0 and UD1 stay refused)
+    # UD0 should be rejected cleanly with ValueError (UD2 is lowered since #1021 and UD1 since #1607; UD0 stays refused)
     try:
         lower(list(Decoder(64, bytes.fromhex("0f ff c0 c3"), ip=0x1000)), [], {}, {}, {})
     except ValueError as exc:

@@ -6,3 +6,5 @@ EXPORTS
     legacy_controls
     ffreep_top
     ffree_empty
+    fstsw_top
+    ffree_fincstp

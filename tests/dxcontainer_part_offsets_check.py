@@ -163,6 +163,35 @@ class DXContainerPartOffsets(unittest.TestCase):
                     dict(pointer_slot="0x1108", size_slot="0x1100", pointer_code_refs=[], size_code_refs=[]),
                 ])
 
+    def test_call_evidence_code_refs_size_match_and_virtual_extent(self):
+        image_base = 0x180000000
+        framed = container()
+        no_program = container().replace(b"DXIL", b"STAT", 1)  # Renames the part tag only.
+        empty = b"DXBC" + bytes(16) + struct.pack("<III", 1, 32, 0)
+        # VirtualSize 0x180 < SizeOfRawData 0x200: bytes 0x180..0x1FF of the raw section are not mapped.
+        payload = bytearray(0x180)
+        payload[0x20:0x20 + len(no_program)] = no_program
+        payload[0x80:0x90] = struct.pack("<IIQ", len(framed), 0, image_base + 0x1124)
+        payload[0xA0:0xB0] = struct.pack("<IIQ", len(framed) + 1, 0, image_base + 0x1124)  # Size disagrees.
+        payload[0xC0:0xE0] = empty
+        payload[0x124:0x180] = framed  # 0x180 - 0x5C: ends exactly at VirtualSize.
+        raw = bytearray(minimal_pe(bytes(payload), image_base=image_base))
+        raw[0x200 + 0x190:0x200 + 0x190 + len(framed)] = framed  # Raw slack beyond VirtualSize.
+        memory = defaultdict(list, {0x1020: [(0x2030, "lea")], 0x1124: [(0x2000, "lea")],
+                                    0x1080: [(0x2010, "mov")], 0x1088: [(0x2020, "mov")]})
+        with pefile.PE(data=bytes(raw), fast_load=True) as pe:
+            rows = shader_containers(bytes(raw), pe, memory)
+        self.assertEqual(len(framed), 0x5C)
+        self.assertEqual(rows, [
+            dict(rva="0x1020", bytes=len(no_program), parts=["STAT", "NOTE"], root_header=None,
+                 framed_dxil=False, size_pointer_pairs=[], direct_code_refs=["0x2030"]),
+            dict(rva="0x1124", bytes=len(framed), parts=["DXIL", "NOTE"], root_header=None,
+                 framed_dxil=True, size_pointer_pairs=[
+                     dict(pointer_slot="0x1088", size_slot="0x1080",
+                          pointer_code_refs=["0x2020"], size_code_refs=["0x2010"]),
+                 ], direct_code_refs=["0x2000"]),
+        ])
+
     def test_scene_records_advances_cursor_by_consumed_deflate_bytes(self):
         def make_record(blob, *, name=b"owned", tail=b"", extra_stored=0):
             encoder = zlib.compressobj(wbits=-15)

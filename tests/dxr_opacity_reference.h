@@ -19,6 +19,9 @@ constexpr std::uint32_t instanceForceOpaque = 0x4, instanceForceNonOpaque = 0x8;
 // geometries whose non-opaque candidates the shader commits.
 constexpr int acceptShift = 16;
 constexpr std::uint32_t geometryCount = 4;
+constexpr float defaultTMin = 0.25f;
+// Keep TMin below the closest intersection at distance 1 in either direction.
+constexpr float maxTMin = 0.5f;
 
 using Vec = std::array<double, 3>;
 using Vertex = std::array<float, 3>;
@@ -72,14 +75,14 @@ inline std::vector<Instance> instances() {
 }
 
 // 42 rays per instance: both directions along z, each ray flag set and each accept mask.
-inline std::vector<Ray> rays() {
+inline std::vector<Ray> rays(float nearT) {
     std::vector<Ray> result;
     for (const auto& instance : instances())
         for (int reversed = 0; reversed < 2; ++reversed)
             for (const auto flags : rayFlags)
                 for (const auto accept : acceptMasks)
                     result.push_back({{instance.translateX + .25f, .25f, reversed ? 5.f : 0.f},
-                                      {0, 0, reversed ? -1.f : 1.f}, .25f, 8, flags | accept << acceptShift});
+                                      {0, 0, reversed ? -1.f : 1.f}, nearT, 8, flags | accept << acceptShift});
     return result;
 }
 
@@ -151,11 +154,10 @@ inline Expected evaluate(const std::vector<Vertex>& mesh, const std::vector<std:
 
 // Returns the first ray where the geometric reference and the hand-derived
 // table disagree, or the ray count when they agree everywhere.
-inline std::size_t first_reference_mismatch() {
+inline std::size_t first_reference_mismatch(const std::vector<Ray>& all) {
     const auto mesh = vertices();
     const auto geometries = geometryFlags();
     const auto scene = instances();
-    const auto all = rays();
     constexpr std::size_t perFlags = std::size(acceptMasks), perDirection = std::size(rayFlags) * perFlags;
     for (std::size_t i = 0; i < all.size(); ++i) {
         const auto& instance = scene[i / (2 * perDirection)];

@@ -52,6 +52,7 @@ class RootChecks(unittest.TestCase):
         struct.pack_into("<I", data, 32, 1)
         self.assertEqual(inspect_root(data), (0x8888, 16))
         for label, offset, fmt, value in (
+            ("nonzero leading qword", 0, "<Q", 1 << 56), ("version high byte", 20, "<H", 0x17a),
             ("version", 20, "<H", 121), ("zero index", 32, "<I", 0), ("past last index", 32, "<I", 3),
             ("schema outside virtual region", 40, "<Q", 0x60000000),
             ("directory past buffer", 56, "<Q", BASE + 384),
@@ -80,6 +81,20 @@ class RootChecks(unittest.TestCase):
             struct.pack_into("<Q", valid, 8, BASE + offset)
             self.assertEqual(inspect_root(valid), (ROOT_TYPE, 32))
 
+    def test_empty_root_and_schema_stride(self) -> None:
+        """Reject a zero-length root even when its schema also declares zero bytes; read types at a 32-byte stride."""
+        from resource_root import inspect_root
+        empty = resource()
+        struct.pack_into("<I", empty, 276, 0)  # root block length (entry 2 at 256 + 16, length at +4)
+        struct.pack_into("<I", empty, 184, 0)  # root schema size (entry 1 at 160, size at +24)
+        with self.assertRaises(ValueError):
+            inspect_root(empty)
+        # Byte 16 of the first 32-byte schema entry is not a type field, so a copy of the
+        # root type there is not a second schema. A 16-byte stride would read it at 176.
+        inner = resource()
+        struct.pack_into("<I", inner, 176, ROOT_TYPE)
+        self.assertEqual(inspect_root(inner), (ROOT_TYPE, 32))
+
     def test_read_budget(self) -> None:
         from resource_root import read_member
 
@@ -90,6 +105,11 @@ class RootChecks(unittest.TestCase):
         for stored, decoded in ((1, (2 << 20) + 1), ((2 << 20) + 1, 1)):
             with self.assertRaisesRegex(ValueError, "budget"):
                 read_member(Unreadable(b"x"), 0, stored, decoded)
+
+        # A member that decodes to exactly 2 MiB is within the budget.
+        data = resource() + bytes((2 << 20) - 400)
+        packed = zlib.compress(data)
+        self.assertEqual(read_member(io.BytesIO(packed), 0, len(packed), len(data)), (ROOT_TYPE, 32))
 
 
 if __name__ == "__main__":

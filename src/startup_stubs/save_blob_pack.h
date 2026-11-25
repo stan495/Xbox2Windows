@@ -26,17 +26,44 @@ struct Piece {
     std::vector<unsigned char> bytes;
 };
 
-// False when the byte count does not fit in size_t. out is unchanged then.
+struct PieceSize {
+    std::size_t name_bytes;
+    std::size_t data_bytes;
+};
+
+namespace detail {
+inline bool add_piece_size(std::size_t& bytes, std::size_t name_bytes, std::size_t data_bytes)
+{
+    if (data_bytes > UINT32_MAX) return false;
+    if (name_bytes >= SIZE_MAX - data_bytes) return false;
+    const std::size_t extra = name_bytes + 1 + data_bytes;
+    if (extra > SIZE_MAX - bytes) return false;
+    bytes += extra;
+    return true;
+}
+}  // namespace detail
+
+// False when a payload exceeds uint32_t (BlobInfo::size) or the total byte count does not fit in
+// size_t. out is unchanged then.
+inline bool bytes_needed(const PieceSize* sizes, std::size_t count, std::size_t& out)
+{
+    if (count > SIZE_MAX / sizeof(Blob)) return false;
+    if (count && !sizes) return false;
+    std::size_t bytes = count * sizeof(Blob);
+    for (std::size_t i = 0; i < count; ++i)
+        if (!detail::add_piece_size(bytes, sizes[i].name_bytes, sizes[i].data_bytes)) return false;
+    out = bytes;
+    return true;
+}
+
+// False when a payload exceeds uint32_t (BlobInfo::size) or the total byte count does not fit in
+// size_t. out is unchanged then.
 inline bool bytes_needed(const std::vector<Piece>& pieces, std::size_t& out)
 {
     if (pieces.size() > SIZE_MAX / sizeof(Blob)) return false;
     std::size_t bytes = pieces.size() * sizeof(Blob);
-    for (const Piece& piece : pieces) {
-        if (piece.name.size() == SIZE_MAX) return false;
-        const std::size_t extra = piece.name.size() + 1 + piece.bytes.size();
-        if (extra < piece.name.size() || extra > SIZE_MAX - bytes) return false;
-        bytes += extra;
-    }
+    for (const Piece& piece : pieces)
+        if (!detail::add_piece_size(bytes, piece.name.size(), piece.bytes.size())) return false;
     out = bytes;
     return true;
 }
@@ -44,6 +71,7 @@ inline bool bytes_needed(const std::vector<Piece>& pieces, std::size_t& out)
 // dest has room for bytes_needed. Pointers in the records address dest itself.
 inline void write(const std::vector<Piece>& pieces, void* dest)
 {
+    if (pieces.empty()) return;
     auto* records = static_cast<Blob*>(dest);
     auto* cursor = reinterpret_cast<unsigned char*>(records + pieces.size());
     for (std::size_t i = 0; i < pieces.size(); ++i) {
@@ -59,4 +87,4 @@ inline void write(const std::vector<Piece>& pieces, void* dest)
     }
 }
 
-}
+}  // namespace x2w_save_pack

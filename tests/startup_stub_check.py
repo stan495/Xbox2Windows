@@ -98,18 +98,46 @@ for scenario, stdout in (("none", ""), ("physical", "physical ok")):
 
 run = subprocess.run([consumer, "dstorage"], capture_output=True, text=True, env=env, timeout=20)
 traps_after = open(log, encoding="ascii").read().count("x2w-trap ") if os.path.exists(log) else 0
-ok = run.returncode == 0 and "dstorage ok" in run.stdout and "x2w-trap" not in run.stderr and traps_after == len(cases)
+summary = re.search(r"x2w-dstorage BCPack summary: requests formats=([^;]*); zero-filled formats=([^\r\n]*)",
+                    run.stderr)
+requests_by_format = {int(f): int(n) for f, n in re.findall(r"(\d+):(\d+)", summary.group(1))} if summary else {}
+blank_by_format = {int(f): int(n) for f, n in re.findall(r"(\d+):(\d+)", summary.group(2))} if summary else {}
+bcpack_ok = (requests_by_format.get(6) == 1 and blank_by_format.get(6) == 1
+             and requests_by_format.get(1) == 2 and blank_by_format.get(1, 0) == 0
+             and requests_by_format.get(3) == 3 and blank_by_format.get(3, 0) == 0
+             and requests_by_format.get(4) == 4 and blank_by_format.get(4, 0) == 0
+             and requests_by_format.get(5) == 3 and blank_by_format.get(5, 0) == 0
+             and requests_by_format.get(7) == 4 and blank_by_format.get(7, 0) == 0)
+if summary:
+    print(summary.group(0))
+else:
+    print("BCPack summary: missing")
+ok = (run.returncode == 0 and "dstorage ok" in run.stdout and "x2w-trap" not in run.stderr
+      and traps_after == len(cases) and bcpack_ok)
 print(f"dstorage control: exit={run.returncode} {'ok' if ok else 'MISMATCH'}")
 if not ok:
     failures.append(f"dstorage control: exit {run.returncode}, stderr {run.stderr.strip()!r}")
 
 # Page arrays changed between EnqueueRequest and Submit: a replaced entry, and an unreadable array.
+# #1843: a new status array's slots start complete with S_OK until EnqueueStatus marks one pending.
+run = subprocess.run([consumer, "dstorage-status-initial"], capture_output=True, text=True, env=env, timeout=20)
+ok = run.returncode == 0 and "dstorage-status-initial ok" in run.stdout and "x2w-trap" not in run.stderr
+print(f"dstorage status-array initial state: exit={run.returncode} {'ok' if ok else 'MISMATCH'}")
+if not ok:
+    failures.append(f"dstorage status-array initial state: exit {run.returncode}, stdout {run.stdout.strip()!r}")
+
 run = subprocess.run([consumer, "dstorage-pages"], capture_output=True, text=True, env=env, timeout=20)
 print(run.stdout.strip())
 ok = run.returncode == 0 and "dstorage-pages ok" in run.stdout and "x2w-trap" not in run.stderr
 print(f"dstorage page-array control: exit={run.returncode} {'ok' if ok else 'MISMATCH'}")
 if not ok:
     failures.append(f"dstorage page-array control: exit {run.returncode}, stdout {run.stdout.strip()!r}")
+
+run = subprocess.run([consumer, "dstorage-error-record"], capture_output=True, text=True, env=env, timeout=20)
+ok = run.returncode == 0 and "dstorage-error-record ok" in run.stdout and "x2w-trap" not in run.stderr
+print(f"dstorage error record: exit={run.returncode} {'ok' if ok else 'MISMATCH'}")
+if not ok:
+    failures.append(f"dstorage error record: exit {run.returncode}, stderr {run.stderr.strip()!r}")
 
 store_env = dict(env, X2W_RUNTIME_PROXY="1", X2W_FAKE_USER="1")
 run = subprocess.run([consumer, "store"], capture_output=True, text=True, env=store_env, timeout=20)
@@ -121,6 +149,14 @@ ok = (run.returncode == 0 and "store context 5832575300000001" in run.stdout
 print(f"store context: exit={run.returncode} {'ok' if ok else 'MISMATCH'}")
 if not ok:
     failures.append(f"store context: exit {run.returncode}, stdout {run.stdout.strip()!r}, stderr {run.stderr.strip()!r}")
+
+# File::GetFileInformation after Close returns ERROR_INVALID_HANDLE, with the trap log unset and set.
+run = subprocess.run([consumer, "dstorage-file-information"], capture_output=True, text=True, env=env, timeout=20)
+print(run.stdout.strip())
+ok = run.returncode == 0 and "dstorage-file-information ok" in run.stdout and "x2w-trap" not in run.stderr
+print(f"dstorage file-information control: exit={run.returncode} {'ok' if ok else 'MISMATCH'}")
+if not ok:
+    failures.append(f"dstorage file-information control: exit {run.returncode}, stdout {run.stdout.strip()!r}")
 
 if failures:
     print("FAIL")

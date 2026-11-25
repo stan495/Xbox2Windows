@@ -1498,7 +1498,39 @@ def compacted_image(
 
 
 COMPACTED_BIT = 1 << 63
+USABLE_XCOMP_HEADER_BITS = range(3, 63)
 BAD_MXCSR = 0x11F80
+
+
+def select_host_disabled_xcomp_bit(host_xcr0: int) -> int:
+    """Return the lowest component bit in XCOMP_BV[62:3] that host_xcr0 disables."""
+    if (host_xcr0 & 7) != 7:
+        raise ValueError(f"host XCR0 lacks x87|SSE|AVX: {host_xcr0:#x}")
+    for bit in USABLE_XCOMP_HEADER_BITS:
+        if not (host_xcr0 & (1 << bit)):
+            return bit
+    raise ValueError(f"host XCR0 enables every usable XCOMP_BV bit 3..62: {host_xcr0:#x}")
+
+
+def native_compacted_header_must_fault(image: bytes, host_xcr0: int, mxcsr_mask: int) -> bool:
+    """Return True iff native XRSTOR must #GP on a guest-rejected compacted/standard header under host_xcr0.
+
+    The lifted profile always rejects XCOMP_BV bits outside x87|SSE|AVX (0x7). Native XRSTOR only #GPs on
+    XCOMP_BV bits disabled in host_xcr0, so a fixed guest-unsupported case whose listed components are all
+    enabled on the host (for example MPX bits 3/4 when XCR0=0x1f) is checked on lifted code only.
+    """
+    xstate_bv, xcomp_bv = struct.unpack_from("<QQ", image, 512)
+    if not (xcomp_bv >> 63):
+        return True
+    listed = xcomp_bv & ~COMPACTED_BIT
+    if any(image[528:576]) or (xstate_bv & ~listed):
+        return True
+    rfbm = struct.unpack_from("<I", image, 832)[0]
+    if (xstate_bv & 2) and (rfbm & 2):
+        mxcsr = struct.unpack_from("<I", image, 24)[0]
+        if mxcsr & ~mxcsr_mask:
+            return True
+    return bool(listed & ~host_xcr0)
 
 
 def compacted_cases(mxcsr_mask: int):
@@ -1553,12 +1585,13 @@ def compacted_cases(mxcsr_mask: int):
     return cases
 
 
-def run_compacted(label: str, harness, fn, a: bytes, b: bytes, *, b_offset: int = 0):
-    """Call one export (harness is None for lifted code); returns (faulted with #GP, output bytes)."""
+def _run_compacted_raw(label: str, harness, fn, a: bytes, b: bytes, *, b_offset: int = 0):
+    """Call one export (harness is None for lifted code); returns (faulted, exception_text, output_bytes)."""
     buf_a, ptr_a, a_pre, a_off, a_post = alloc_aligned_buffer(a)
     buf_b, ptr_b, b_pre, b_off, b_post = alloc_aligned_buffer(b, offset=b_offset)
     buf_out, ptr_out, o_pre, o_off, o_post = alloc_aligned_buffer(FILL)
     faulted = False
+    exc_text: str | None = None
     try:
         if harness is not None:
             harness.call_native(fn, ptr_a, ptr_b, ptr_out)
@@ -1567,9 +1600,16 @@ def run_compacted(label: str, harness, fn, a: bytes, b: bytes, *, b_offset: int 
     except OSError as exc:
         assert GP_MESSAGE in str(exc).lower(), (label, exc)
         faulted = True
+        exc_text = str(exc)
     check_guards_and_read(buf_a, a_pre, a_off, a_post, f"{label} input_a")
     check_guards_and_read(buf_b, b_pre, b_off, b_post, f"{label} input_b")
-    return faulted, check_guards_and_read(buf_out, o_pre, o_off, o_post, f"{label} output")
+    return faulted, exc_text, check_guards_and_read(buf_out, o_pre, o_off, o_post, f"{label} output")
+
+
+def run_compacted(label: str, harness, fn, a: bytes, b: bytes, *, b_offset: int = 0):
+    """Call one export (harness is None for lifted code); returns (faulted with #GP, output bytes)."""
+    faulted, _, out = _run_compacted_raw(label, harness, fn, a, b, b_offset=b_offset)
+    return faulted, out
 
 
 def expected_compacted(*args, **kwargs):
@@ -1602,11 +1642,85 @@ def check_compacted_run(side: str, name: str, label, harness, fn, a: bytes, b: b
         assert_equal_output(side, name, label, got, want)
 
 
+def check_host_xcr0_selection_controls(lifted: dict, cases, mxcsr_mask: int, deprecates_cs_ds: bool) -> int:
+    """Synthetic host-XCR0 controls (including MPX XCR0=0x1f) so non-MPX hosts still cover the bit selection."""
+    controls = 0
+    for synthetic_xcr0, expected_bit in (
+        (0x7, 3),
+        (0x1F, 5),
+        (0xE7, 3),
+        (0xFF, 8),
+        (0x2FF, 8),
+        (0x3FF, 10),
+        ((1 << 62) - 1, 62),
+    ):
+        picked = select_host_disabled_xcomp_bit(synthetic_xcr0)
+        assert picked == expected_bit, (hex(synthetic_xcr0), picked, expected_bit)
+        assert not (synthetic_xcr0 & (1 << picked)), (hex(synthetic_xcr0), picked)
+        assert picked in USABLE_XCOMP_HEADER_BITS, picked
+        controls += 1
+
+    for bad_xcr0 in (0x0, 0x3, (1 << 63) - 1):
+        try:
+            select_host_disabled_xcomp_bit(bad_xcr0)
+        except ValueError:
+            controls += 1
+        else:
+            raise AssertionError(f"select_host_disabled_xcomp_bit accepted {bad_xcr0:#x}")
+
+    # Synthetic MPX host (XCR0=0x1f: x87, SSE, AVX, BNDREGS, BNDCSR) and PKRU host (XCR0=0x2e7):
+    # fixed guest-unsupported XCOMP_BV bits enabled by that host stay refused on lifted code, while the native
+    # fault predicate excludes them and keeps every other invalid header (including xstate-bit3 subset violations).
+    mpx_xcr0 = 0x1F
+    pkru_xcr0 = 0x2E7
+    by_label = {label: (a, b) for label, a, b in cases}
+    mpx_native_accepted = {"xcomp-bit3", "xcomp-bit4", "xcomp-bit3-only"}
+    for label, a, b in cases:
+        want = expected_compacted(COMPACTED_DYNMASK_EXPORT, a, b, mxcsr_mask, deprecates_cs_ds)
+        if want is not None:
+            continue
+        must_fault_mpx = native_compacted_header_must_fault(b, mpx_xcr0, mxcsr_mask)
+        if label in mpx_native_accepted:
+            assert not must_fault_mpx, f"MPX host XCR0=0x1f must not require native #GP on {label}"
+        else:
+            assert must_fault_mpx, f"MPX host XCR0=0x1f must still require native #GP on {label}"
+        controls += 1
+    assert not native_compacted_header_must_fault(by_label["xcomp-bit9"][1], pkru_xcr0, mxcsr_mask)
+    assert native_compacted_header_must_fault(by_label["xcomp-bit3"][1], pkru_xcr0, mxcsr_mask)
+    controls += 2
+
+    # Mutation control for XCR0=0x1f: picking bit 3 (the old hardcoded assumption) fails the native-fault gate,
+    # whereas the selected disabled bit (bit 5) passes both the native-fault gate and the lifted DLL refusal.
+    mpx_bit = select_host_disabled_xcomp_bit(mpx_xcr0)
+    assert mpx_bit == 5
+    base = make_xsave_image(mxcsr_mask, xstate_bv=7, fcw=0x027F, fop=0, mxcsr=0x3F80, seed=50)
+    mpx_fault_img = compacted_image(mxcsr_mask, 7, COMPACTED_BIT | 7 | (1 << mpx_bit), 7, seed=67)
+    mutated_bit3_img = compacted_image(mxcsr_mask, 7, COMPACTED_BIT | 7 | (1 << 3), 7, seed=67)
+    assert native_compacted_header_must_fault(mpx_fault_img, mpx_xcr0, mxcsr_mask)
+    assert not native_compacted_header_must_fault(mutated_bit3_img, mpx_xcr0, mxcsr_mask)
+    assert expected_compacted(COMPACTED_DYNMASK_EXPORT, base, mpx_fault_img, mxcsr_mask, deprecates_cs_ds) is None
+    check_compacted_run("lifted", COMPACTED_DYNMASK_EXPORT, f"mpx-sim-bit{mpx_bit}", None,
+                        lifted[COMPACTED_DYNMASK_EXPORT], base, mpx_fault_img, None)
+    controls += 2
+    return controls
+
+
 def check_compacted_xrstor(
-    harness, native: dict, lifted: dict, altered: dict, mxcsr_mask: int, deprecates_cs_ds: bool
+    harness, native: dict, lifted: dict, altered: dict, mxcsr_mask: int, deprecates_cs_ds: bool, host_xcr0: int
 ) -> dict:
     """XSAVEC -> XRSTOR round trips, hand-built compacted headers, their #GP rules and the mutation controls."""
-    counts = {"roundtrip": 0, "header": 0, "gp": 0, "altered": {}, "controls": 0}
+    counts = {
+        "roundtrip": 0,
+        "header": 0,
+        "gp": 0,
+        "altered": {},
+        "controls": 0,
+        "host_disabled_bit": select_host_disabled_xcomp_bit(host_xcr0),
+        "native_xcomp_bit": None,
+        "native_xcomp_exc": None,
+        "lifted_only_xcomp": [],
+        "xcr0_controls": 0,
+    }
 
     def model(name, a, b, **mutations):
         return expected_compacted(name, a, b, mxcsr_mask, deprecates_cs_ds, **mutations)
@@ -1630,11 +1744,50 @@ def check_compacted_xrstor(
         want = model(COMPACTED_DYNMASK_EXPORT, a, b)
         check_compacted_run("lifted", COMPACTED_DYNMASK_EXPORT, label, None, lifted[COMPACTED_DYNMASK_EXPORT], a, b, want)
         if COMPACTED_DYNMASK_EXPORT in native:
-            check_compacted_run(
-                "native", COMPACTED_DYNMASK_EXPORT, label, harness, native[COMPACTED_DYNMASK_EXPORT], a, b, want
-            )
+            if want is not None or native_compacted_header_must_fault(b, host_xcr0, mxcsr_mask):
+                check_compacted_run(
+                    "native", COMPACTED_DYNMASK_EXPORT, label, harness, native[COMPACTED_DYNMASK_EXPORT], a, b, want
+                )
+            else:
+                counts["lifted_only_xcomp"].append(label)
         counts["header"] += want is not None
         counts["gp"] += want is None
+
+    # Host-XCR0-derived native fault comparison: keep the header and request identical to a valid compacted restore
+    # control except for one XCOMP_BV component bit in [3..62] that the measured host XCR0 actually disables.
+    disabled_bit = counts["host_disabled_bit"]
+    base = make_xsave_image(mxcsr_mask, xstate_bv=7, fcw=0x027F, fop=0, mxcsr=0x3F80, seed=50)
+    valid_ctrl = compacted_image(mxcsr_mask, 7, COMPACTED_BIT | 7, 7, seed=67)
+    host_fault = compacted_image(mxcsr_mask, 7, COMPACTED_BIT | 7 | (1 << disabled_bit), 7, seed=67)
+    host_fault_rfbm0 = compacted_image(mxcsr_mask, 0, COMPACTED_BIT | (1 << disabled_bit), 0, seed=67)
+    assert host_fault[:520] == valid_ctrl[:520] and host_fault[528:] == valid_ctrl[528:]
+    assert (struct.unpack_from("<Q", host_fault, 520)[0] ^ struct.unpack_from("<Q", valid_ctrl, 520)[0]) == (1 << disabled_bit)
+    want_valid_ctrl = model(COMPACTED_DYNMASK_EXPORT, base, valid_ctrl)
+    assert want_valid_ctrl is not None
+    assert model(COMPACTED_DYNMASK_EXPORT, base, host_fault) is None
+    assert model(COMPACTED_DYNMASK_EXPORT, base, host_fault_rfbm0) is None
+    check_compacted_run("lifted", COMPACTED_DYNMASK_EXPORT, "host-xcr0-valid-control", None,
+                        lifted[COMPACTED_DYNMASK_EXPORT], base, valid_ctrl, want_valid_ctrl)
+    check_compacted_run("lifted", COMPACTED_DYNMASK_EXPORT, f"host-xcr0-disabled-bit{disabled_bit}", None,
+                        lifted[COMPACTED_DYNMASK_EXPORT], base, host_fault, None)
+    check_compacted_run("lifted", COMPACTED_DYNMASK_EXPORT, f"host-xcr0-disabled-bit{disabled_bit}-rfbm0", None,
+                        lifted[COMPACTED_DYNMASK_EXPORT], base, host_fault_rfbm0, None)
+    if COMPACTED_DYNMASK_EXPORT in native:
+        check_compacted_run("native", COMPACTED_DYNMASK_EXPORT, "host-xcr0-valid-control", harness,
+                            native[COMPACTED_DYNMASK_EXPORT], base, valid_ctrl, want_valid_ctrl)
+        faulted, exc_text, got = _run_compacted_raw(
+            f"native {COMPACTED_DYNMASK_EXPORT} host-xcr0-disabled-bit{disabled_bit}",
+            harness, native[COMPACTED_DYNMASK_EXPORT], base, host_fault,
+        )
+        assert faulted, (
+            f"native {COMPACTED_DYNMASK_EXPORT} accepted host-disabled XCOMP_BV bit {disabled_bit} (XCR0={host_xcr0:#x})"
+        )
+        assert got == FILL, f"native {COMPACTED_DYNMASK_EXPORT} host-disabled bit {disabled_bit}: output written before #GP"
+        check_compacted_run("native", COMPACTED_DYNMASK_EXPORT, f"host-xcr0-disabled-bit{disabled_bit}-rfbm0", harness,
+                            native[COMPACTED_DYNMASK_EXPORT], base, host_fault_rfbm0, None)
+        counts["native_xcomp_bit"] = disabled_bit
+        counts["native_xcomp_exc"] = exc_text
+    counts["gp"] += 2
 
     # A misaligned compacted image faults like a misaligned standard one, before anything is stored.
     mis_a, mis_b = compact_state_pairs(mxcsr_mask)[0][0], compacted_image(mxcsr_mask, 7, COMPACTED_BIT | 7, 7)
@@ -1665,6 +1818,7 @@ def check_compacted_xrstor(
         counts["altered"][name] = diffs
 
     counts["controls"] = check_compacted_controls(lifted, cases, mxcsr_mask, deprecates_cs_ds)
+    counts["xcr0_controls"] = check_host_xcr0_selection_controls(lifted, cases, mxcsr_mask, deprecates_cs_ds)
     return counts
 
 
@@ -1762,7 +1916,10 @@ def check_differential(
     lifted_lib.host_xsave_area_size.argtypes = []
     lifted_lib.host_xsave_area_size.restype = ctypes.c_uint32
     host_area_size = int(lifted_lib.host_xsave_area_size())
-    print(f"Host XSAVE area (CPUID.0D.0:EBX): {host_area_size} bytes", flush=True)
+    lifted_lib.host_xcr0.argtypes = []
+    lifted_lib.host_xcr0.restype = ctypes.c_uint64
+    host_xcr0 = int(lifted_lib.host_xcr0())
+    print(f"Host XSAVE area (CPUID.0D.0:EBX): {host_area_size} bytes, XCR0={host_xcr0:#x}", flush=True)
 
     lifted_lib.host_deprecates_fpu_cs_ds.argtypes = []
     lifted_lib.host_deprecates_fpu_cs_ds.restype = ctypes.c_uint32
@@ -1884,7 +2041,7 @@ def check_differential(
         layout_checks = check_xsaveopt_layout(harness, native, lifted, mxcsr_mask)
         opt_controls = check_xsaveopt_controls(mxcsr_mask, deprecates_cs_ds)
         compacted = check_compacted_xrstor(
-            harness, native, compacted_lifted, compacted_altered, mxcsr_mask, deprecates_cs_ds
+            harness, native, compacted_lifted, compacted_altered, mxcsr_mask, deprecates_cs_ds, host_xcr0
         )
 
         # Native comparison keeps active x87/SSE payloads: a flipped FCW, ST0 or XMM0 byte must fail, while an
@@ -1923,6 +2080,18 @@ def check_differential(
 
         es0_64 = fp_caps[(True, True, False)][:3]
         es1_64 = fp_caps[(True, True, True)][:3]
+        if compacted["native_xcomp_bit"] is not None:
+            native_xcomp_note = (
+                f"native host-disabled XCOMP_BV bit {compacted['native_xcomp_bit']} "
+                f"(XCR0={host_xcr0:#x}, exc={compacted['native_xcomp_exc']!r}, valid restore control matched)"
+            )
+            if compacted["lifted_only_xcomp"]:
+                native_xcomp_note += f", lifted-only guest XCOMP_BV refusals={compacted['lifted_only_xcomp']}"
+        else:
+            native_xcomp_note = (
+                f"host-disabled XCOMP_BV bit {compacted['host_disabled_bit']} "
+                f"(XCR0={host_xcr0:#x}, native skipped: no XSAVEC)"
+            )
         print(
             f"{total} native/lifted/reference XSAVE/XRSTOR cases across {len(EXPORTS)} exports matched bit-for-bit "
             f"(mxcsr_mask={mxcsr_mask:#x}, deprecates_fpu_cs_ds={deprecates_cs_ds}, "
@@ -1933,8 +2102,8 @@ def check_differential(
             f"{liveness_checks} xsavec MXCSR-liveness checks passed; "
             f"{layout_checks} xsaveopt layout readbacks and {opt_controls} xsaveopt mutation controls passed; "
             f"compacted xrstor: {compacted['roundtrip']} xsavec round trips, {compacted['header']} valid and "
-            f"{compacted['gp']} #GP header cases, ALTER_OP diverged on {compacted['altered']}, "
-            f"{compacted['controls']} mutation controls passed"
+            f"{compacted['gp']} #GP header cases ({native_xcomp_note}), ALTER_OP diverged on {compacted['altered']}, "
+            f"{compacted['controls']} mutation controls and {compacted['xcr0_controls']} host-XCR0 controls passed"
         )
     finally:
         harness.close()

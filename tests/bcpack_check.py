@@ -35,6 +35,10 @@ class TextureChecks(unittest.TestCase):
         delayed, = probe(prefix, 50000, prefetch_mask=0x01, prefetch=b"\xaa",
                          next_mask=0x08, next_bytes=b"\xe3")
         self.assertEqual(delayed["refill_symbol_indices"], [4564])
+        # E4 adds one to the refilled state. Every later slot stays in range, so the
+        # offset survives the decode and the lane ends at 01000001, not 01000000.
+        off_by_one, = probe(prefix, 50000, prefetch_mask=0x08, prefetch=b"\xe4")
+        self.assertEqual(off_by_one["status"], "header_match")
         surplus, = probe(prefix, 50000, prefetch_mask=0x08, prefetch=b"\xe3",
                          next_mask=0x08, next_bytes=b"\x00")
         self.assertEqual(surplus["status"], "header_match")
@@ -91,6 +95,11 @@ class TextureChecks(unittest.TestCase):
         result, = probe(prefix, 2)
         self.assertEqual((result["lane"], result["status"]), (4, "verified_constant_lane"))
         self.assertFalse(probe(prefix, 3))
+        # Mode DC has four escape slots, so each early symbol adds 256 * 4 + 1 = 1025
+        # to the state: two symbols give 2**24 + 2050 = 01000802 with no refills.
+        prefix[4::8] = bytes.fromhex("dc 03 01 00 08 02")
+        result, = probe(prefix, 2)
+        self.assertEqual((result["mode"], result["status"]), (0xDC, "verified_constant_lane"))
         prefix[4::8] = bytes.fromhex("de 04 01 00 11 30")
         result, = probe(prefix, 11358)
         self.assertEqual((result["refill_bytes"], result["status"]), (1, "header_match"))
@@ -104,8 +113,18 @@ class TextureChecks(unittest.TestCase):
             probe(prefix, 11358, prefetch_mask=0x15, prefetch=bytes([125]))
         prefix[12] -= 1
         self.assertFalse(probe(prefix, 11358))
-        with self.assertRaises(ValueError):
-            probe(prefix[:-1], 2)
+        for short_or_long in (prefix[:-1], prefix + b"\x00"):
+            with self.assertRaises(ValueError):
+                probe(short_or_long, 2)
+
+    def test_input_bounds(self):
+        # No lane carries a known mode, so the largest block count returns at once.
+        self.assertEqual(probe(bytes(48), 1 << 20), [])
+        for options in ({"blocks": (1 << 20) + 1},
+                        {"blocks": 2, "prefetch_mask": 0x100, "prefetch": b"\x00"},
+                        {"blocks": 2, "next_mask": 0x100, "next_bytes": b"\x00"}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                probe(bytes(48), **options)
 
     def test_contiguous_six_byte_lanes(self):
         prefix = bytearray(48)
@@ -128,8 +147,9 @@ class TextureChecks(unittest.TestCase):
         self.assertFalse(scan[1]["known_constant_mode"])
         known = scan_lanes(bytes.fromhex("de 03 01 00 40 02") + bytes(42), lane_stride=6)
         self.assertTrue(known[0]["known_constant_mode"])
-        with self.assertRaises(ValueError):
-            scan_lanes(prefix[:-1], lane_stride=6)
+        for short_or_long in (prefix[:-1], prefix + b"\x00"):
+            with self.assertRaises(ValueError):
+                scan_lanes(short_or_long, lane_stride=6)
         with self.assertRaises(ValueError):
             scan_lanes(prefix, lane_stride=7)
 

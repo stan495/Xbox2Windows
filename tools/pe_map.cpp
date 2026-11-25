@@ -1305,8 +1305,10 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
                 if (!*word) break;
                 const bool by_ordinal = IMAGE_SNAP_BY_ORDINAL64(*word);
                 const auto ordinal = by_ordinal ? static_cast<std::uint32_t>(IMAGE_ORDINAL64(*word)) : 0u;
-                const auto* hint = by_ordinal ? nullptr : image.at<WORD>(*word & 0x7fffffff);
-                const char* name = hint ? image.string((*word & 0x7fffffff) + sizeof(WORD)) : nullptr;
+                // Bits 31..62 of a named thunk must be zero: masking them could alias a valid low RVA.
+                const std::uint64_t name_rva = by_ordinal ? 0 : *word;
+                const auto* hint = by_ordinal || name_rva >> 31 ? nullptr : image.at<WORD>(name_rva);
+                const char* name = hint ? image.string(name_rva + sizeof(WORD)) : nullptr;
                 if (!by_ordinal && !name) return release(fail(MAP_FORMAT, "import name for %s outside image", dll));
                 void* bound = resolve(dll, name, ordinal);
                 if (!bound && name) return release(fail(MAP_UNRESOLVED_IMPORT, "unresolved import %s!%s", dll, name));

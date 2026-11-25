@@ -57,7 +57,7 @@ void decoded(const char* name, const SamplerWords& words, unsigned u, unsigned v
     expect(name, "static AddressV", s.AddressV, v);
     expect(name, "static AddressW", s.AddressW, w);
     expect(name, "static MaxAnisotropy", s.MaxAnisotropy, anisotropy);
-    expect(name, "static ComparisonFunc", s.ComparisonFunc, 8);  // ALWAYS
+    expect(name, "static ComparisonFunc", s.ComparisonFunc, 1);  // NEVER for ordinary filters
     expect(name, "static BorderColor", s.BorderColor, 0);       // TRANSPARENT_BLACK
     expect(name, "static ShaderRegister", s.ShaderRegister, reg);
     expect(name, "static RegisterSpace", s.RegisterSpace, 0);
@@ -70,7 +70,7 @@ void decoded(const char* name, const SamplerWords& words, unsigned u, unsigned v
     expect(name, "dynamic AddressV", d.AddressV, v);
     expect(name, "dynamic AddressW", d.AddressW, w);
     expect(name, "dynamic MaxAnisotropy", d.MaxAnisotropy, anisotropy);
-    expect(name, "dynamic ComparisonFunc", d.ComparisonFunc, 8);
+    expect(name, "dynamic ComparisonFunc", d.ComparisonFunc, 1);
     for (float component : d.BorderColor)
         if (component != 0.0f) fail(name, "dynamic BorderColor", 1, 0);
     if (d.MipLODBias != 0.0f || d.MinLOD != 0.0f || d.MaxLOD != FLT_MAX) fail(name, "dynamic LOD range", 0, 0);
@@ -198,6 +198,7 @@ int main(int argc, char** argv)
         ++cases;
         const D3D12_SAMPLER_DESC b = border_sampler();
         expect("border sampler", "Filter", b.Filter, point);
+        expect("border sampler", "ComparisonFunc", b.ComparisonFunc, 1);
         expect("border sampler", "AddressU", b.AddressU, border);
         expect("border sampler", "AddressV", b.AddressV, border);
         expect("border sampler", "AddressW", b.AddressW, border);

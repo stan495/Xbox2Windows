@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <wrl/client.h>
 
 #include <array>
@@ -29,6 +30,48 @@ struct Stream {
     Root root;
     Stage vs;
 };
+struct alignas(8) Layout {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE tag;
+    D3D12_INPUT_LAYOUT_DESC desc;
+};
+// X2W_TEST_INPUT_LAYOUT: the stream also declares two per-vertex float3 elements, TEXCOORD in slot 0 and POSITION in
+// slot 1 at D3D12_APPEND_ALIGNED_ELEMENT, in the opposite order of the vertex shader's input signature
+// (startup_stream_fetch_check.py).
+struct LayoutStream {
+    Layout layout;
+    Stream stream;
+};
+static const D3D12_INPUT_ELEMENT_DESC layout_elements[] = {
+    {"TEXCOORD", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+};
+
+namespace {
+void* stream_root = nullptr;
+void* stream_alternate_root = nullptr;
+std::vector<char> stream_root_bytes;
+
+// X2W_TEST_ROOT_FLAGS: root signature flags (startup_root_heap.cpp). A root signature with flags is serialized as
+// version 1.1, which carries the descriptor-heap indexing flags; without flags the version 1.0 blob is unchanged.
+HRESULT serialize_root(const D3D12_ROOT_SIGNATURE_DESC& desc, ComPtr<ID3DBlob>& blob)
+{
+    if (!desc.Flags) return D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr);
+    std::vector<D3D12_ROOT_PARAMETER1> parameters(desc.NumParameters);
+    for (UINT i = 0; i < desc.NumParameters; ++i) {
+        const D3D12_ROOT_PARAMETER& p = desc.pParameters[i];
+        if (p.ParameterType != D3D12_ROOT_PARAMETER_TYPE_CBV && p.ParameterType != D3D12_ROOT_PARAMETER_TYPE_SRV) return E_INVALIDARG;
+        parameters[i].ParameterType = p.ParameterType;
+        parameters[i].Descriptor = {p.Descriptor.ShaderRegister, p.Descriptor.RegisterSpace, D3D12_ROOT_DESCRIPTOR_FLAG_NONE};
+        parameters[i].ShaderVisibility = p.ShaderVisibility;
+    }
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned{D3D_ROOT_SIGNATURE_VERSION_1_1};
+    versioned.Desc_1_1 = {desc.NumParameters, parameters.data(), 0, nullptr, desc.Flags};
+    return D3D12SerializeVersionedRootSignature(&versioned, &blob, nullptr);
+}
+}
+void* stream_root_signature() { return stream_root; }
+void* stream_alternate_root_signature() { return stream_alternate_root; }
+const std::vector<char>& stream_root_blob() { return stream_root_bytes; }
 
 int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char* root_path,
                             bool hardware, bool textured, Microsoft::WRL::ComPtr<IDXGIAdapter>& adapter,
@@ -38,6 +81,15 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
     std::vector<char> vs{std::istreambuf_iterator<char>(vs_file), {}};
     std::vector<char> ps{std::istreambuf_iterator<char>(ps_file), {}};
     if (vs.empty() || ps.empty()) return 3;
+    // X2W_TEST_DEBUG_LAYER=1 (startup_root_heap.cpp): the debug layer must be on before the first device exists.
+    if (GetEnvironmentVariableW(L"X2W_TEST_DEBUG_LAYER", nullptr, 0)) {
+        ComPtr<ID3D12Debug> debug;
+        if (FAILED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
+            std::printf("no debug layer: skipped\n");
+            return 77;
+        }
+        debug->EnableDebugLayer();
+    }
 
     ComPtr<IDXGIFactory4> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 4;
@@ -69,36 +121,78 @@ int prepare_stream_pipeline(const char* vs_path, const char* ps_path, const char
 
     D3D12_ROOT_SIGNATURE_DESC root_desc{};
     const D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
-    D3D12_ROOT_PARAMETER table{};
+    D3D12_ROOT_PARAMETER textured_parameters[2]{};
     if (textured) {
+        D3D12_ROOT_PARAMETER& table = textured_parameters[0];
         table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         table.DescriptorTable = {1, &srv};
         table.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         root_desc.NumParameters = 1;
-        root_desc.pParameters = &table;
+        root_desc.pParameters = textured_parameters;
+        if (GetEnvironmentVariableW(L"X2W_TEST_ROOT_RESET", nullptr, 0)) {
+            D3D12_ROOT_PARAMETER& constant = textured_parameters[1];
+            constant.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            constant.Constants = {0, 0, 1};
+            constant.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+            root_desc.NumParameters = 2;
+        }
     }
+    // X2W_TEST_ROOT_CBV=<mode> declares root parameter 0 as a constant buffer view (startup_root_cbv.cpp);
+    // "wrong_type" declares a shader resource view there instead.
+    D3D12_ROOT_PARAMETER root_cbv{};
+    char cbv_mode[16]{};
+    if (!textured && GetEnvironmentVariableA("X2W_TEST_ROOT_CBV", cbv_mode, sizeof(cbv_mode))) {
+        root_cbv.ParameterType = std::strcmp(cbv_mode, "wrong_type") == 0 ? D3D12_ROOT_PARAMETER_TYPE_SRV
+                                                                          : D3D12_ROOT_PARAMETER_TYPE_CBV;
+        root_cbv.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        root_desc.NumParameters = 1;
+        root_desc.pParameters = &root_cbv;
+        char flags[16]{};
+        if (GetEnvironmentVariableA("X2W_TEST_ROOT_FLAGS", flags, sizeof(flags)))
+            root_desc.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(std::strtoul(flags, nullptr, 0));
+    }
+    // A runtime or device that rejects the requested root signature flags is a capability skip.
+    const int rejected = root_desc.Flags ? 77 : 0;
     ComPtr<ID3DBlob> blob;
-    if (FAILED(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr))) return 6;
+    if (FAILED(serialize_root(root_desc, blob))) return rejected ? rejected : 6;
+    stream_root_bytes.assign(static_cast<const char*>(blob->GetBufferPointer()),
+                             static_cast<const char*>(blob->GetBufferPointer()) + blob->GetBufferSize());
     std::ofstream(root_path, std::ios::binary).write(static_cast<const char*>(blob->GetBufferPointer()), blob->GetBufferSize());
     using CreateRoot = HRESULT (WINAPI*)(void*, UINT, const void*, SIZE_T, REFIID, void**);
     using CreateStream = HRESULT (WINAPI*)(void*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
     auto** slots = *static_cast<void***>(device);
     ID3D12RootSignature* root = nullptr;
     if (FAILED(reinterpret_cast<CreateRoot>(slots[16])(device, 0, blob->GetBufferPointer(), blob->GetBufferSize(),
-                                                        __uuidof(ID3D12RootSignature), reinterpret_cast<void**>(&root)))) return 7;
+                                                        __uuidof(ID3D12RootSignature), reinterpret_cast<void**>(&root)))) {
+        if (rejected) std::printf("CreateRootSignature rejects flags 0x%x: skipped\n", static_cast<unsigned>(root_desc.Flags));
+        return rejected ? rejected : 7;
+    }
+    stream_root = root;
+    if (std::strcmp(cbv_mode, "switch_root") == 0) {
+        root_cbv.Descriptor.ShaderRegister = 1;
+        ComPtr<ID3DBlob> alternate;
+        if (FAILED(serialize_root(root_desc, alternate)) ||
+            FAILED(reinterpret_cast<CreateRoot>(slots[16])(device, 0, alternate->GetBufferPointer(),
+                                                            alternate->GetBufferSize(), __uuidof(ID3D12RootSignature),
+                                                            &stream_alternate_root))) return 7;
+    }
 
-    Stream stream{{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {ps.data(), ps.size()}},
-                  {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root},
-                  {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {vs.data(), vs.size()}}};
+    LayoutStream with_layout{{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, {layout_elements, 2}},
+                             {{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {ps.data(), ps.size()}},
+                              {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root},
+                              {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {vs.data(), vs.size()}}}};
+    const bool layout = GetEnvironmentVariableW(L"X2W_TEST_INPUT_LAYOUT", nullptr, 0) != 0;
+    void* first = layout ? static_cast<void*>(&with_layout) : static_cast<void*>(&with_layout.stream);
+    const SIZE_T whole = layout ? sizeof(with_layout) : sizeof(with_layout.stream);
     auto submit = [&](SIZE_T bytes) {
-        D3D12_PIPELINE_STATE_STREAM_DESC desc{bytes, &stream};
+        D3D12_PIPELINE_STATE_STREAM_DESC desc{bytes, first};
         const auto hr = reinterpret_cast<CreateStream>(slots[86])(device, &desc, __uuidof(ID3D12PipelineState), &pso);
         return SUCCEEDED(hr) && pso;
     };
     // A truncated last shader must not publish a partial request, even with readable backing memory.
-    if (!submit(sizeof(stream) - 8)) return 8;
+    if (!submit(whole - 8)) return 8;
     if (GetEnvironmentVariableW(L"X2W_TEST_TRUNCATED_ONLY", nullptr, 0)) return 0;
-    if (!submit(sizeof(stream))) return 9;
+    if (!submit(whole)) return 9;
     return 0;
 }
 
@@ -166,7 +260,9 @@ Word invoke(void* object, unsigned index, Word a, Word b, Word c, Word d,
 int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width, UINT height,
                        DXGI_FORMAT format, UINT scissor_width, StreamTarget& state)
 {
-    const bool integer = format == DXGI_FORMAT_R32_UINT || format == DXGI_FORMAT_R32_SINT;
+    StreamMrtFormat mrt{};
+    const bool typed = stream_mrt_format(format, mrt);
+    const bool integer = typed && mrt.integer;
     const bool narrow = format == DXGI_FORMAT_A8_UNORM || format == DXGI_FORMAT_R8_UNORM;
     // A caller that wants a second RGBA8 target sets state.count to 2 before the call.
     const UINT count = state.count = integer || state.count == 2 ? 2 : 1;
@@ -187,7 +283,7 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
     for (UINT i = 0; i < count; ++i) {
         auto& target = targets[i];
         const auto view_format = i ? DXGI_FORMAT_R8G8B8A8_UNORM : format;
-        const auto resource_format = !i && integer ? DXGI_FORMAT_R32_TYPELESS : view_format;
+        const auto resource_format = !i && integer ? mrt.typeless : view_format;
         D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1,
             resource_format, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
         const D3D12_CLEAR_VALUE optimized_clear{view_format, {clear[0], clear[1], clear[2], clear[3]}};
@@ -196,7 +292,7 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
         D3D12_RENDER_TARGET_VIEW_DESC view{view_format, D3D12_RTV_DIMENSION_TEXTURE2D, {}};
         rtvs[i] = {first_rtv + SIZE_T{i} * stride};
         invoke(guest, 20, arg(target.texture.Get()), arg(&view), rtvs[i].ptr);
-        target.row_bytes = width * (view_format == DXGI_FORMAT_R32G32B32A32_FLOAT ? 16 : view_format == DXGI_FORMAT_A8_UNORM ||
+        target.row_bytes = width * (!i && typed ? mrt.bytes : view_format == DXGI_FORMAT_A8_UNORM ||
                                     view_format == DXGI_FORMAT_R8_UNORM ? 1 : 4);
     }
 
@@ -216,8 +312,17 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
     invoke(list, 139, arg(allocator));
     for (UINT i = 0; i < count; ++i) invoke(list, 52, rtvs[i].ptr, arg(clear));
     invoke(list, 50, count, arg(rtvs.data()));
-    invoke(list, 21, 1, arg(&viewport));
-    invoke(list, 22, 1, arg(&rect));
+    // X2W_TEST_VIEWPORT: "none" and "grow" never set a viewport or scissor; "rect" and "reset" set a rectangle smaller than the target.
+    wchar_t mode[8] = L"";
+    GetEnvironmentVariableW(L"X2W_TEST_VIEWPORT", mode, 8);
+    const bool none = std::wcscmp(mode, L"none") == 0 || std::wcscmp(mode, L"grow") == 0;
+    const bool inset = std::wcscmp(mode, L"rect") == 0 || std::wcscmp(mode, L"reset") == 0;
+    const D3D12_VIEWPORT inner{2, 1, 4, 2, 0, 1};
+    const D3D12_RECT inner_rect{2, 1, 6, 3};
+    if (!none) {
+        invoke(list, 21, 1, inset ? arg(&inner) : arg(&viewport));
+        invoke(list, 22, 1, inset ? arg(&inner_rect) : arg(&rect));
+    }
     invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     invoke(list, 25, arg(pso));
     return 0;

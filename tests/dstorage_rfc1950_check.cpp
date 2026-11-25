@@ -120,12 +120,97 @@ int run(std::string_view scenario)
         throw std::runtime_error("Failed request published bytes");
     if (dstorage_rfc1950::complete_one(codec.Get(), decoded) != S_FALSE)
         throw std::runtime_error("Duplicate completion");
+    if (decoded.status != E_PENDING || decoded.consumed || decoded.produced)
+        throw std::runtime_error("Empty queue left the previous result in decoded");
     return 0;
+}
+
+// Requests the adapter must refuse before zlib runs, built by hand and passed to decode()
+// directly. Each refusal reports zero bytes and leaves the destination and its guards alone.
+int refusals()
+{
+    constexpr unsigned char sentinel = 0xca;
+    std::array<BYTE, 768> plain{};
+    for (size_t i = 0; i < plain.size(); ++i) plain[i] = BYTE((i % 32) * 13 + (i / 256));
+    uLongf compressed_size = compressBound(static_cast<uLong>(plain.size()));
+    std::vector<BYTE> compressed(compressed_size);
+    if (compress2(compressed.data(), &compressed_size, plain.data(), static_cast<uLong>(plain.size()), 6) != Z_OK)
+        throw std::runtime_error("Compress fixture");
+    compressed.resize(compressed_size);
+    std::array<BYTE, 768 + 2> output{};
+
+    using Request = DSTORAGE_CUSTOM_DECOMPRESSION_REQUEST;
+    struct Case {
+        const char* name;
+        void (*edit)(Request&);
+        HRESULT expected;
+    };
+    // Above ULONG_MAX the low 32 bits still hold the true size, so a truncating adapter
+    // would run zlib on the whole stream instead of refusing the request.
+    static constexpr UINT64 above_ulong = UINT64{1} << 32;
+    const Case cases[] = {
+        {"baseline", [](Request&) {}, S_OK},
+        {"format_custom_1", [](Request& r) {
+             r.CompressionFormat = static_cast<DSTORAGE_COMPRESSION_FORMAT>(DSTORAGE_CUSTOM_COMPRESSION_0 + 1);
+         }, E_NOTIMPL},
+        {"format_gdeflate", [](Request& r) { r.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_GDEFLATE; },
+         E_NOTIMPL},
+        {"flag_dest_in_upload_heap",
+         [](Request& r) { r.Flags = DSTORAGE_CUSTOM_DECOMPRESSION_FLAG_DEST_IN_UPLOAD_HEAP; }, E_NOTIMPL},
+        {"null_src", [](Request& r) { r.SrcBuffer = nullptr; }, E_INVALIDARG},
+        {"null_dst", [](Request& r) { r.DstBuffer = nullptr; }, E_INVALIDARG},
+        {"zero_src", [](Request& r) { r.SrcSize = 0; }, E_INVALIDARG},
+        {"zero_dst", [](Request& r) { r.DstSize = 0; }, E_INVALIDARG},
+        {"src_over_ulong_max", [](Request& r) { r.SrcSize += above_ulong; }, E_INVALIDARG},
+        {"dst_over_ulong_max", [](Request& r) { r.DstSize += above_ulong; }, E_INVALIDARG},
+    };
+    int failures = 0;
+    for (const auto& test : cases) {
+        output.fill(sentinel);
+        Request request{};
+        request.Id = 7;
+        request.CompressionFormat = DSTORAGE_CUSTOM_COMPRESSION_0;
+        request.Flags = DSTORAGE_CUSTOM_DECOMPRESSION_FLAG_NONE;
+        request.SrcSize = compressed.size();
+        request.SrcBuffer = compressed.data();
+        request.DstSize = plain.size();
+        request.DstBuffer = output.data() + 1;
+        test.edit(request);
+        const auto decoded = dstorage_rfc1950::decode(request);
+        const bool success = test.expected == S_OK;
+        const bool counts = success ? decoded.consumed == compressed.size() && decoded.produced == plain.size()
+                                    : !decoded.consumed && !decoded.produced;
+        const bool guards = output.front() == sentinel && output.back() == sentinel;
+        const bool bytes = success ? std::equal(plain.begin(), plain.end(), output.begin() + 1)
+                                   : std::all_of(output.begin(), output.end(), [sentinel](BYTE b) { return b == sentinel; });
+        if (decoded.status != test.expected || !counts || !guards || !bytes) {
+            std::printf("FAIL: refusals %s: status 0x%08lx consumed=%llu produced=%llu, expected 0x%08lx%s\n",
+                test.name, static_cast<unsigned long>(decoded.status), decoded.consumed, decoded.produced,
+                static_cast<unsigned long>(test.expected), guards && bytes ? "" : ", destination changed");
+            ++failures;
+            continue;
+        }
+        std::printf("refusals %s: 0x%08lx\n", test.name, static_cast<unsigned long>(decoded.status));
+    }
+
+    dstorage_rfc1950::DecodeResult decoded{S_OK, 1, 2};
+    const HRESULT no_queue = dstorage_rfc1950::complete_one(nullptr, decoded);
+    if (no_queue != E_POINTER || decoded.status != E_PENDING || decoded.consumed || decoded.produced) {
+        std::printf("FAIL: refusals null_queue: returned 0x%08lx, decoded 0x%08lx\n",
+            static_cast<unsigned long>(no_queue), static_cast<unsigned long>(decoded.status));
+        ++failures;
+    } else {
+        std::puts("refusals null_queue: E_POINTER, decoded reset to E_PENDING");
+    }
+    return failures ? 1 : 0;
 }
 }
 
 int main(int argc, char** argv)
 {
-    try { return argc == 2 ? run(argv[1]) : 2; }
+    try {
+        if (argc == 2 && std::string_view(argv[1]) == "refusals") return refusals();
+        return argc == 2 ? run(argv[1]) : 2;
+    }
     catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
 }
