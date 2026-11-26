@@ -5244,7 +5244,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for dst, value in zip(dests, values):
                 vector[dst] = value
                 sample_dest[dst] = vector_loads
-        elif m := match(r"(image_sample_c(?:(?:_lz|_l|_b|_cl|_b_cl)?(?:_o)?|_c?d(?:_o)?(?:_g16)?)) "
+        elif m := match(r"(image_sample_c(?:(?:_lz|_l|_b|_cl|_b_cl)?(?:_o)?|_c?d(?:_cl)?(?:_o)?(?:_g16)?)) "
                         r"(v\d+), (?:v\[(\d+):(\d+)\]|\[(v\d+), (v\d+), (v\d+)\]), "
                         r"s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x1 dim:SQ_RSRC_IMG_2D"):
             # RDNA 2 orders the address as offset, bias, reference, gradients, UV, explicit LOD or clamp.
@@ -5270,6 +5270,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if first is None and op != "image_sample_c_lz":
                 raise ValueError("Comparison sample requires a contiguous address")
             width = 3 + has_offset + has_level_operand + gradient_words + has_clamp
+            # LLVM 15 prints the padded 16-VGPR tuple for a nine-word sequential address.
+            if width == 9 and first is not None and int(last) - int(first) == 15:
+                if int(last) > 255:
+                    raise ValueError("Comparison sample VGPR out of range")
+                last = str(int(first) + width - 1)
             address = ([f"v{n}" for n in registers(first, last, width)]
                        if first is not None else nsa)
             if any(int(reg[1:]) > 255 for reg in (dst, *address)):
